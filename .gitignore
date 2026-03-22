@@ -43,6 +43,7 @@ __pycache__/
 Thumbs.db
 
 # Large local dependency cache
+deps/vcpkg/
 deps/vcpkg/buildtrees/
 deps/vcpkg/downloads/
 deps/vcpkg/installed/

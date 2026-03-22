@@ -100,4 +100,3 @@ Older entries below keep some of the original internal milestone numbering from 
 - Arthur Reboul Salze
 - AWS Thinkbox Frost core
 - Codex
-- ChatGPT 5.4

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="Frost4Blender.png" alt="Frost for Blender" width="420">
+  <img src="Frost4Blender.png" alt="Frost for Blender" width="210">
 </p>
 
 # Frost Particle Meshing for Blender
@@ -99,5 +99,4 @@ After building, copy the generated `.pyd` into `frost_blender_addon/` so Blender
 - Arthur Reboul Salze
 - AWS Thinkbox Frost core
 - Codex
-- ChatGPT 5.4
 - Antigravity project generation / iteration workflow

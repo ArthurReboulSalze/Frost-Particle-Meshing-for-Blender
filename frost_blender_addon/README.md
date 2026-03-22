@@ -69,4 +69,3 @@ Use this variant when:
 - Arthur Reboul Salze
 - AWS Thinkbox Frost core
 - Codex
-- ChatGPT 5.4
