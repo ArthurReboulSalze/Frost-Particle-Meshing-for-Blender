@@ -5,8 +5,6 @@ Frost Particle Meshing is a Blender addon that converts particles, point clouds,
 Current release: `1.24.1`
 Target Blender version: `5+`
 
-Repository: [ArthurReboulSalze/Frost-for-Blender](https://github.com/ArthurReboulSalze/Frost-for-Blender)
-
 <p align="center">
   <img src="Frost4Blender_screen.png" alt="Screenshot of the Frost Particle Meshing plugin in Blender" width="900">
 </p>
