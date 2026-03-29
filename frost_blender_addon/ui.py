@@ -42,8 +42,10 @@ def format_meshing_backend_label(backend_name):
 def update_mesh_callback(self, context):
     """Trigger mesh update if auto_update is enabled"""
     global _last_update_time, _update_pending
-    
-    if not self.auto_update:
+
+    obj = getattr(self, "id_data", None)
+    props = getattr(obj, "frost_properties", None) if obj and obj.type == 'MESH' else None
+    if not props or not props.auto_update:
         return
     
     # Debounce: skip if last update was less than 50ms ago
@@ -56,11 +58,8 @@ def update_mesh_callback(self, context):
     # Import locally to avoid circular import during registration
     from . import operator
     
-    # self is FrostProperties or FrostSourceItem
-    # For FrostSourceItem, id_data is still the Object
-    obj = self.id_data
     if obj and obj.type == 'MESH':
-        operator.update_frost_mesh(obj, context)
+        operator.request_frost_update(obj, source="property")
 
 
 class FrostSourceItem(PropertyGroup):

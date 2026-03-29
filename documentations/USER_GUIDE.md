@@ -1,7 +1,7 @@
 # Frost for Blender - User Guide
 
 Supported Blender version: `5+`  
-Compatible addon release: `1.25.0+`
+Compatible addon release: `1.26.0+`
 
 ---
 
@@ -60,6 +60,18 @@ Examples:
 - `CPU Fallback`: GPU was requested, but Frost switched back to the CPU for safety
 
 This is useful because it avoids confusing a safe CPU fallback with a real GPU performance result.
+
+### Animated Sources
+
+`MESH` and `POINT_CLOUD` sources now use Blender's evaluated geometry.
+
+That means Frost can now follow:
+
+- shape keys
+- armatures / bones
+- animated modifiers
+- Alembic geometry caches
+- animated point clouds
 
 ### Particle Sources
 
@@ -121,22 +133,10 @@ These remain shared addon controls regardless of whether the source mesh came fr
 Current testing indicates:
 
 - CPU is still usually faster on low-poly scenes
-- Vulkan can already become faster on heavier / high-poly scenes depending on the setup
+- Vulkan can now get close to CPU or move ahead on heavier / high-poly scenes depending on the setup
+- very dense animated scenes can still show more frame-to-frame variance on Vulkan while the GPU cache warms up
 
 So the Vulkan backend is no longer just a tech demo, but it is also not yet a universal CPU replacement.
-
----
-
-## Important Source Limitation
-
-For `MESH` sources, Frost still reads raw mesh data directly.
-
-That means a non-applied `Subdivision Surface` modifier is not automatically used as Frost source geometry yet.
-
-If you want Frost to use the subdivided mesh today:
-
-1. apply the modifier, or
-2. use real subdivided geometry
 
 ---
 

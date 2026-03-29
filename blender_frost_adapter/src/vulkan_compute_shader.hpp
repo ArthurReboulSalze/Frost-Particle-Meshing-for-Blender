@@ -25,6 +25,7 @@ struct VulkanParticleComputeSettings {
   bool allowCpuCompactedPairs = true;
   bool preferGpuCompactedPairs = false;
   bool limitToBoundaryActiveVoxels = false;
+  bool retainParticleBounds = true;
   bool readbackCoverageCounts = false;
   bool readbackScalarField = true;
   bool retainParticleData = true;
@@ -120,6 +121,11 @@ bool run_frost_vulkan_generate_compact_surface_vertices_from_resident_cells(
     const VulkanParticleComputeResult &computeResult,
     uint32_t activeCellCount, const std::vector<uint32_t> &triangleOffsets,
     uint32_t totalTriangleCount, std::string &outError);
+
+bool ensure_frost_vulkan_resident_surface_cells(
+    const std::vector<uint32_t> &activeCellIndices,
+    const std::vector<uint32_t> &activeCellCubeIndices,
+    std::string &outError);
 
 bool get_frost_vulkan_resident_surface_mesh_view(
     uint32_t activeCellCount, VulkanResidentSurfaceMeshView &outView,

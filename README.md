@@ -6,7 +6,7 @@
 
 Frost for Blender is a Blender `5+` addon that turns particles, point clouds, and mesh vertices into polygonal surfaces using the Thinkbox Frost core, with an in-progress Vulkan GPU path in the same package.
 
-Current release: `1.25.0`  
+Current release: `1.26.0`  
 <p align="center">
   <img src="Frost4Blender_screen.png" alt="Screenshot of the Frost for Blender addon inside Blender" width="900">
 </p>
@@ -30,7 +30,7 @@ Current release: `1.25.0`
 
 - The CPU path is the stable reference path and remains the most feature-complete option.
 - The Vulkan GPU path is already functional, but it is still a work in progress.
-- Current testing indicates that Vulkan is usually still below the CPU path on low-poly scenes, while it can already move above the CPU path on heavier / high-poly scenes depending on the mesh and settings.
+- Current testing indicates that CPU still usually wins on low-poly scenes, while Vulkan now reaches parity or can move ahead on heavier / high-poly scenes depending on the mesh, resolution, and animation state.
 - The UI now shows the backend actually used for the last meshing pass, including when a requested GPU run fell back to the CPU for safety.
 
 ## Installation
@@ -50,7 +50,8 @@ The current distribution model is a single package:
 ## Important Notes
 
 - `Vertex Refinement` still forces the final surface build back to the CPU path for now.
-- For `MESH` sources, Frost still reads raw mesh data and does not yet automatically use a non-applied modifier stack such as `Subdivision Surface`.
+- `MESH` and `POINT_CLOUD` sources now use evaluated Blender geometry, so shape keys, armatures, Alembic caches, and animated point data are taken into account.
+- The Vulkan path is still being optimized, and very dense animated scenes can still fluctuate more than the CPU path during playback.
 - Restart Blender after replacing `frost_native.dll` or updating the addon files.
 
 ## Documentation

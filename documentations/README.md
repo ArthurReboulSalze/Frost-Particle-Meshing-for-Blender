@@ -1,7 +1,7 @@
 # Frost for Blender - Documentation Index
 
-Current addon version: `1.25.0`  
-Last update: `2026-03-27`
+Current addon version: `1.26.0`  
+Last update: `2026-03-29`
 
 ## Main Documents
 
@@ -39,6 +39,6 @@ Release history and notable technical changes.
 
 - The public package is now a single Blender zip for the current `CPU + Vulkan` workflow.
 - The Vulkan backend is still in active development.
-- Current testing indicates that Vulkan is usually slower than CPU on low-poly scenes, while heavier / high-poly scenes can already favor Vulkan depending on the case.
+- Current testing indicates that CPU still usually wins on low-poly scenes, while heavier / high-poly scenes can now bring Vulkan close to parity or ahead depending on the case.
 - `Vertex Refinement` still forces the final surface build back to the CPU path.
-- `MESH` sources still read raw mesh data, so non-applied mesh modifiers are not automatically evaluated yet.
+- `MESH` and `POINT_CLOUD` sources now read evaluated Blender geometry, including deformations and caches active in the current frame.

@@ -10,14 +10,14 @@ Supported Methods:
 - Zhu-Bridson: Advanced fluid meshing
 
 Author: Arthur Reboul Salze
-Version: 1.25.0
+Version: 1.26.0
 Blender: 5+
 """
 
 bl_info = {
     "name": "Frost Particle Meshing",
     "author": "Arthur Reboul Salze",
-    "version": (1, 25, 0),
+    "version": (1, 26, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Frost",
     "description": "Particle meshing plugin with Thinkbox CPU and the current Vulkan GPU backend work.",
@@ -42,6 +42,23 @@ from . import operator
 from . import ui
 
 
+def _iter_frost_source_objects(props):
+    """Yield enabled source objects referenced by a Frost object."""
+    if not props:
+        return
+
+    if props.source_object:
+        yield props.source_object
+
+    for item in props.sources:
+        if item.enabled and item.object:
+            yield item.object
+
+
+def _frost_has_sources(props):
+    return bool(props and (props.source_object or len(props.sources) > 0))
+
+
 @persistent
 def frost_frame_change_handler(scene):
     """Update Frost meshes on frame change"""
@@ -57,13 +74,11 @@ def frost_frame_change_handler(scene):
                 props = getattr(obj, "frost_properties", None)
                 
                 # Check for Main Source OR Additional Sources
-                has_source = props and (props.source_object or len(props.sources) > 0)
+                has_source = _frost_has_sources(props)
                 
                 if has_source and props.auto_update:
                     try:
-                        # Context might be restricted in handlers, pass None or constructed context
-                        # update_frost_mesh only needs context for potential lookups (which we might not need if we have the obj)
-                        operator.update_frost_mesh(obj, bpy.context)
+                        operator.request_frost_update(obj, source="frame")
                     except Exception as e:
                         print(f"Frost Animation Error on {obj.name}: {e}")
     except ReferenceError:
@@ -79,7 +94,7 @@ _visibility_cache = {}
 @persistent
 def frost_visibility_handler(scene, depsgraph):
     """
-    Check for objects transitioning from Hidden -> Visible.
+    Check for source-driven depsgraph changes and visibility transitions.
     Triggers an immediate mesh update if Auto Update is enabled.
     """
     # Avoid errors if operator/adapter not loaded
@@ -87,6 +102,24 @@ def frost_visibility_handler(scene, depsgraph):
         return
 
     try:
+        updated_objects = set()
+        updated_data_blocks = set()
+
+        for update in depsgraph.updates:
+            update_id = getattr(update, "id", None)
+            if update_id is None:
+                continue
+
+            original_id = getattr(update_id, "original", update_id)
+            if isinstance(original_id, bpy.types.Object):
+                updated_objects.add(original_id)
+                if getattr(update, "is_updated_geometry", False):
+                    data = getattr(original_id, "data", None)
+                    if data is not None:
+                        updated_data_blocks.add(data)
+            else:
+                updated_data_blocks.add(original_id)
+
         # Check all objects in scene (robust) 
         # depsgraph updates might not contain all info for property changes
         for obj in scene.objects:
@@ -103,17 +136,41 @@ def frost_visibility_handler(scene, depsgraph):
                 
                 # Logic: If becoming visible NOW, and was previously hidden
                 # AND Auto Update is ON -> Trigger Update
+                triggered_update = False
                 if is_visible and not was_visible:
                     if props.auto_update:
                         try:
                             # We must re-check if source exists
-                            if props.source_object or len(props.sources) > 0:
-                                operator.update_frost_mesh(obj, bpy.context)
+                            if _frost_has_sources(props):
+                                operator.request_frost_update(obj, source="visibility")
+                                triggered_update = True
                         except Exception as e:
                             print(f"Frost Visibility Update Error: {e}")
 
                 # Update cache
                 _visibility_cache[obj.name] = is_visible
+
+                if triggered_update or not props.auto_update or not _frost_has_sources(props):
+                    continue
+
+                source_changed = False
+                for source_obj in _iter_frost_source_objects(props):
+                    if source_obj == obj:
+                        continue
+                    if source_obj in updated_objects:
+                        source_changed = True
+                        break
+
+                    source_data = getattr(source_obj, "data", None)
+                    if source_data is not None and source_data in updated_data_blocks:
+                        source_changed = True
+                        break
+
+                if source_changed:
+                    try:
+                        operator.request_frost_update(obj, source="depsgraph")
+                    except Exception as e:
+                        print(f"Frost Source Update Error on {obj.name}: {e}")
                 
     except Exception:
         pass

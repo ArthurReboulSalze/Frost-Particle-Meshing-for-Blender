@@ -3,11 +3,13 @@
 #include "cuda/tables.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <glslang/Public/resource_limits_c.h>
@@ -1030,12 +1032,12 @@ layout(push_constant) uniform SurfaceMeshPushConstants {
     int cellDimY;
     int domainDimX;
     int domainDimY;
+    int domainDimZ;
     int domainMinX;
     int domainMinY;
     int domainMinZ;
     float voxelLength;
     float surfaceIsoValue;
-    uint _padding0;
     uint _padding1;
 } pc;
 
@@ -1057,6 +1059,10 @@ layout(std430, set = 0, binding = 3) readonly buffer InputTriangleOffsets {
 
 layout(std430, set = 0, binding = 4) writeonly buffer OutputCompactTriangleVertices {
     float compactTriangleVertices[];
+};
+
+layout(std430, set = 0, binding = 5) writeonly buffer OutputCompactTriangleEdgeIds {
+    uint compactTriangleEdgeIds[];
 };
 
 const ivec3 kCornerOffsets[8] = ivec3[8](
@@ -1132,6 +1138,43 @@ int tri_table_value(uint cubeIndex, uint slot) {
     return kTriTable[int(cubeIndex) * 16 + int(slot)];
 }
 
+uvec4 make_grid_edge_key(uvec3 cellPosition, int edgeIndex) {
+    switch (edgeIndex) {
+        case 0:  return uvec4(cellPosition.x + 0u, cellPosition.y + 0u, cellPosition.z + 0u, 0u);
+        case 1:  return uvec4(cellPosition.x + 1u, cellPosition.y + 0u, cellPosition.z + 0u, 1u);
+        case 2:  return uvec4(cellPosition.x + 0u, cellPosition.y + 1u, cellPosition.z + 0u, 0u);
+        case 3:  return uvec4(cellPosition.x + 0u, cellPosition.y + 0u, cellPosition.z + 0u, 1u);
+        case 4:  return uvec4(cellPosition.x + 0u, cellPosition.y + 0u, cellPosition.z + 1u, 0u);
+        case 5:  return uvec4(cellPosition.x + 1u, cellPosition.y + 0u, cellPosition.z + 1u, 1u);
+        case 6:  return uvec4(cellPosition.x + 0u, cellPosition.y + 1u, cellPosition.z + 1u, 0u);
+        case 7:  return uvec4(cellPosition.x + 0u, cellPosition.y + 0u, cellPosition.z + 1u, 1u);
+        case 8:  return uvec4(cellPosition.x + 0u, cellPosition.y + 0u, cellPosition.z + 0u, 2u);
+        case 9:  return uvec4(cellPosition.x + 1u, cellPosition.y + 0u, cellPosition.z + 0u, 2u);
+        case 10: return uvec4(cellPosition.x + 1u, cellPosition.y + 1u, cellPosition.z + 0u, 2u);
+        case 11: return uvec4(cellPosition.x + 0u, cellPosition.y + 1u, cellPosition.z + 0u, 2u);
+        default: return uvec4(cellPosition.x, cellPosition.y, cellPosition.z, 0u);
+    }
+}
+
+uint packed_grid_edge_id(uvec3 cellPosition, int edgeIndex) {
+    uvec4 key = make_grid_edge_key(cellPosition, edgeIndex);
+    uint domainDimX = uint(max(pc.domainDimX, 0));
+    uint domainDimY = uint(max(pc.domainDimY, 0));
+    uint domainDimZ = uint(max(pc.domainDimZ, 0));
+    uint xEdgeStride = uint(max(pc.domainDimX - 1, 0));
+    uint yEdgeStride = uint(max(pc.domainDimY - 1, 0));
+    uint xEdgeCount = xEdgeStride * domainDimY * domainDimZ;
+    uint yEdgeCount = domainDimX * yEdgeStride * domainDimZ;
+
+    if (key.w == 0u) {
+        return key.x + xEdgeStride * (key.y + domainDimY * key.z);
+    }
+    if (key.w == 1u) {
+        return xEdgeCount + key.x + domainDimX * (key.y + yEdgeStride * key.z);
+    }
+    return xEdgeCount + yEdgeCount + key.x + domainDimX * (key.y + domainDimY * key.z);
+}
+
 void main() {
     uint candidateIndex = gl_GlobalInvocationID.x;
     if (candidateIndex >= pc.candidateCellCount) {
@@ -1176,7 +1219,9 @@ void main() {
         );
     }
 
+    uvec3 cellPosition = uvec3(x, y, z);
     uint outputBase = triangleOffsets[candidateIndex] * 9u;
+    uint outputEdgeIdBase = triangleOffsets[candidateIndex] * 3u;
     uint triangleIndex = 0u;
     for (uint slot = 0u; slot < 15u; slot += 3u) {
         int e0 = tri_table_value(cubeIndex, slot + 0u);
@@ -1195,6 +1240,10 @@ void main() {
         compactTriangleVertices[triangleBase + 6u] = edgeVertices[e2].x;
         compactTriangleVertices[triangleBase + 7u] = edgeVertices[e2].y;
         compactTriangleVertices[triangleBase + 8u] = edgeVertices[e2].z;
+        uint triangleEdgeIdBase = outputEdgeIdBase + triangleIndex * 3u;
+        compactTriangleEdgeIds[triangleEdgeIdBase + 0u] = packed_grid_edge_id(cellPosition, e0);
+        compactTriangleEdgeIds[triangleEdgeIdBase + 1u] = packed_grid_edge_id(cellPosition, e1);
+        compactTriangleEdgeIds[triangleEdgeIdBase + 2u] = packed_grid_edge_id(cellPosition, e2);
         triangleIndex += 1u;
     }
 }
@@ -1291,12 +1340,12 @@ struct SurfaceMeshPushConstants {
   int32_t cellDimY = 0;
   int32_t domainDimX = 0;
   int32_t domainDimY = 0;
+  int32_t domainDimZ = 0;
   int32_t domainMinX = 0;
   int32_t domainMinY = 0;
   int32_t domainMinZ = 0;
   float voxelLength = 1.0f;
   float surfaceIsoValue = 0.0f;
-  uint32_t padding0 = 0;
   uint32_t padding1 = 0;
 };
 
@@ -1320,12 +1369,12 @@ layout(push_constant) uniform SurfaceMeshPushConstants {
     int cellDimY;
     int domainDimX;
     int domainDimY;
+    int domainDimZ;
     int domainMinX;
     int domainMinY;
     int domainMinZ;
     float voxelLength;
     float surfaceIsoValue;
-    uint _padding0;
     uint _padding1;
 } pc;
 
@@ -1605,12 +1654,12 @@ layout(push_constant) uniform SurfaceMeshPushConstants {
     int cellDimY;
     int domainDimX;
     int domainDimY;
+    int domainDimZ;
     int domainMinX;
     int domainMinY;
     int domainMinZ;
     float voxelLength;
     float surfaceIsoValue;
-    uint _padding0;
     uint _padding1;
 } pc;
 
@@ -2494,6 +2543,157 @@ float compute_vulkan_outside_field(
                         std::max(settings.voxelLength, 1.0f));
 }
 
+void compute_vulkan_particle_half_extents_cpu(
+    const float *particle, const float *velocity,
+    const VulkanParticleComputeSettings &settings, float &outHalfExtentX,
+    float &outHalfExtentY, float &outHalfExtentZ) {
+  const float baseRadius =
+      std::max(particle[3] * settings.planningRadiusScale, 0.0f);
+  if (baseRadius <= 0.0f) {
+    outHalfExtentX = 0.0f;
+    outHalfExtentY = 0.0f;
+    outHalfExtentZ = 0.0f;
+    return;
+  }
+
+  if (settings.fieldMode == VulkanScalarFieldMode::zhu_bridson_blend &&
+      settings.kernelSupportRadius > 0.0f) {
+    outHalfExtentX = settings.kernelSupportRadius;
+    outHalfExtentY = settings.kernelSupportRadius;
+    outHalfExtentZ = settings.kernelSupportRadius;
+    return;
+  }
+
+  if (settings.fieldMode != VulkanScalarFieldMode::anisotropic_velocity ||
+      velocity == nullptr) {
+    outHalfExtentX = baseRadius;
+    outHalfExtentY = baseRadius;
+    outHalfExtentZ = baseRadius;
+    return;
+  }
+
+  const float velocityX = velocity[0];
+  const float velocityY = velocity[1];
+  const float velocityZ = velocity[2];
+  const float speed =
+      std::sqrt(velocityX * velocityX + velocityY * velocityY +
+                velocityZ * velocityZ);
+  if (speed <= 1.0e-5f) {
+    outHalfExtentX = baseRadius;
+    outHalfExtentY = baseRadius;
+    outHalfExtentZ = baseRadius;
+    return;
+  }
+
+  const float safeRadius =
+      std::max(baseRadius, std::max(settings.voxelLength, 1.0e-4f));
+  const float stretch =
+      std::min(1.0f + 0.5f * (speed / safeRadius),
+               std::max(settings.anisotropyMaxScale, 1.0f));
+  const float majorRadius = baseRadius * stretch;
+  const float minorRadius = baseRadius / std::sqrt(std::max(stretch, 1.0f));
+  const float directionX = velocityX / speed;
+  const float directionY = velocityY / speed;
+  const float directionZ = velocityZ / speed;
+  const float minorSquared = minorRadius * minorRadius;
+  const float deltaSquared =
+      std::max(majorRadius * majorRadius - minorSquared, 0.0f);
+
+  outHalfExtentX =
+      std::sqrt(deltaSquared * directionX * directionX + minorSquared);
+  outHalfExtentY =
+      std::sqrt(deltaSquared * directionY * directionY + minorSquared);
+  outHalfExtentZ =
+      std::sqrt(deltaSquared * directionZ * directionZ + minorSquared);
+}
+
+bool prepare_vulkan_particle_bounds_cpu(
+    const float *inputParticles, const float *inputVelocities,
+    std::size_t particleCount, const VulkanParticleComputeSettings &settings,
+    int32_t *mappedMinBounds, int32_t *mappedMaxBounds,
+    std::vector<int32_t> *outMinBounds,
+    std::vector<int32_t> *outMaxBounds, int32_t &outDomainMinX,
+    int32_t &outDomainMinY, int32_t &outDomainMinZ, int32_t &outDomainMaxX,
+    int32_t &outDomainMaxY, int32_t &outDomainMaxZ) {
+  if (inputParticles == nullptr || particleCount == 0 ||
+      settings.voxelLength <= 0.0f) {
+    return false;
+  }
+
+  if (outMinBounds != nullptr) {
+    outMinBounds->assign(particleCount * 4, 0);
+  }
+  if (outMaxBounds != nullptr) {
+    outMaxBounds->assign(particleCount * 4, 0);
+  }
+
+  outDomainMinX = std::numeric_limits<int32_t>::max();
+  outDomainMinY = std::numeric_limits<int32_t>::max();
+  outDomainMinZ = std::numeric_limits<int32_t>::max();
+  outDomainMaxX = std::numeric_limits<int32_t>::min();
+  outDomainMaxY = std::numeric_limits<int32_t>::min();
+  outDomainMaxZ = std::numeric_limits<int32_t>::min();
+
+  for (std::size_t i = 0; i < particleCount; ++i) {
+    const float *particle = inputParticles + i * 4;
+    const float *velocity =
+        inputVelocities != nullptr ? (inputVelocities + i * 4) : nullptr;
+    float halfExtentX = 0.0f;
+    float halfExtentY = 0.0f;
+    float halfExtentZ = 0.0f;
+    compute_vulkan_particle_half_extents_cpu(particle, velocity, settings,
+                                             halfExtentX, halfExtentY,
+                                             halfExtentZ);
+
+    const int32_t minVoxelX = static_cast<int32_t>(
+        std::floor((particle[0] - halfExtentX) / settings.voxelLength));
+    const int32_t minVoxelY = static_cast<int32_t>(
+        std::floor((particle[1] - halfExtentY) / settings.voxelLength));
+    const int32_t minVoxelZ = static_cast<int32_t>(
+        std::floor((particle[2] - halfExtentZ) / settings.voxelLength));
+    const int32_t maxVoxelX = static_cast<int32_t>(
+        std::ceil((particle[0] + halfExtentX) / settings.voxelLength));
+    const int32_t maxVoxelY = static_cast<int32_t>(
+        std::ceil((particle[1] + halfExtentY) / settings.voxelLength));
+    const int32_t maxVoxelZ = static_cast<int32_t>(
+        std::ceil((particle[2] + halfExtentZ) / settings.voxelLength));
+
+    const std::size_t offset = i * 4;
+    if (mappedMinBounds != nullptr) {
+      mappedMinBounds[offset + 0] = minVoxelX;
+      mappedMinBounds[offset + 1] = minVoxelY;
+      mappedMinBounds[offset + 2] = minVoxelZ;
+      mappedMinBounds[offset + 3] = 0;
+    }
+    if (mappedMaxBounds != nullptr) {
+      mappedMaxBounds[offset + 0] = maxVoxelX;
+      mappedMaxBounds[offset + 1] = maxVoxelY;
+      mappedMaxBounds[offset + 2] = maxVoxelZ;
+      mappedMaxBounds[offset + 3] = 0;
+    }
+    if (outMinBounds != nullptr) {
+      (*outMinBounds)[offset + 0] = minVoxelX;
+      (*outMinBounds)[offset + 1] = minVoxelY;
+      (*outMinBounds)[offset + 2] = minVoxelZ;
+    }
+    if (outMaxBounds != nullptr) {
+      (*outMaxBounds)[offset + 0] = maxVoxelX;
+      (*outMaxBounds)[offset + 1] = maxVoxelY;
+      (*outMaxBounds)[offset + 2] = maxVoxelZ;
+    }
+
+    outDomainMinX = std::min(outDomainMinX, minVoxelX);
+    outDomainMinY = std::min(outDomainMinY, minVoxelY);
+    outDomainMinZ = std::min(outDomainMinZ, minVoxelZ);
+    outDomainMaxX = std::max(outDomainMaxX, maxVoxelX);
+    outDomainMaxY = std::max(outDomainMaxY, maxVoxelY);
+    outDomainMaxZ = std::max(outDomainMaxZ, maxVoxelZ);
+  }
+
+  return outDomainMinX < outDomainMaxX && outDomainMinY < outDomainMaxY &&
+         outDomainMinZ < outDomainMaxZ;
+}
+
 bool reduce_particle_voxel_bounds(const std::vector<int32_t> &minBounds,
                                   const std::vector<int32_t> &maxBounds,
                                   std::size_t particleCount,
@@ -2530,6 +2730,8 @@ constexpr uint64_t kMaxVoxelScalarFieldCells =
     static_cast<uint64_t>(65535ull) * 64ull;
 constexpr uint64_t kMaxVoxelParticleDistanceEvaluations =
     256ull * 1024ull * 1024ull;
+constexpr uint64_t kMaxVoxelParticleDistanceEvaluationsMetaball =
+    512ull * 1024ull * 1024ull;
 constexpr uint64_t kMaxCompactedVoxelParticlePairs =
     32ull * 1024ull * 1024ull;
 
@@ -2796,8 +2998,7 @@ void filter_boundary_active_voxels(
     return;
   }
 
-  const uint32_t sliceStride =
-      static_cast<uint32_t>(domainDimX * domainDimY);
+  const uint32_t sliceStride = static_cast<uint32_t>(domainDimX * domainDimY);
   outBoundaryVoxelIndices.reserve(inputActiveVoxelIndices.size());
   for (uint32_t packedVoxelIndex : inputActiveVoxelIndices) {
     if (packedVoxelIndex >= voxelCount ||
@@ -3434,6 +3635,47 @@ VulkanSharedContext &get_vulkan_shared_context() {
   return *context;
 }
 
+VkDeviceSize compute_shared_buffer_capacity(VkDeviceSize requestedSize,
+                                            VkDeviceSize previousCapacity) {
+  constexpr VkDeviceSize kSmallBufferAlignment = 64ull * 1024ull;
+  constexpr VkDeviceSize kLargeBufferAlignment = 1024ull * 1024ull;
+  constexpr VkDeviceSize kLargeBufferThreshold = 8ull * 1024ull * 1024ull;
+
+  VkDeviceSize targetCapacity = requestedSize;
+  if (previousCapacity > 0u && previousCapacity < requestedSize) {
+    const VkDeviceSize growthHeadroom =
+        std::max(previousCapacity / 2u, kSmallBufferAlignment);
+    targetCapacity = std::max(requestedSize, previousCapacity + growthHeadroom);
+  } else if (previousCapacity == 0u) {
+    const VkDeviceSize initialHeadroom =
+        std::max(requestedSize / 4u, kSmallBufferAlignment);
+    targetCapacity = requestedSize + initialHeadroom;
+  }
+
+  const VkDeviceSize alignment =
+      (targetCapacity >= kLargeBufferThreshold) ? kLargeBufferAlignment
+                                                : kSmallBufferAlignment;
+  return ((targetCapacity + alignment - 1u) / alignment) * alignment;
+}
+
+bool should_prefer_device_local_host_memory(const char *label,
+                                            VkDeviceSize requestedSize) {
+  constexpr VkDeviceSize kLargeHostSharedBufferThreshold = 512ull * 1024ull;
+  if (requestedSize >= kLargeHostSharedBufferThreshold) {
+    return false;
+  }
+
+  const std::string_view labelView = label != nullptr ? std::string_view(label)
+                                                      : std::string_view();
+  return labelView.find("candidate cell") == std::string_view::npos &&
+         labelView.find("triangle-vertex buffer") ==
+             std::string_view::npos &&
+         labelView.find("triangle-edge-id buffer") ==
+             std::string_view::npos &&
+         labelView.find("triangle-offset buffer") ==
+             std::string_view::npos;
+}
+
 bool ensure_shared_host_buffer(VulkanSharedContext &context,
                                VulkanSharedContext::HostBuffer &hostBuffer,
                                VkDeviceSize requestedSize, const char *label,
@@ -3449,14 +3691,17 @@ bool ensure_shared_host_buffer(VulkanSharedContext &context,
     return true;
   }
 
+  const VkDeviceSize previousCapacity = hostBuffer.capacity;
+  const VkDeviceSize targetCapacity =
+      compute_shared_buffer_capacity(requestedSize, previousCapacity);
   context.release_host_buffer(hostBuffer);
 
   VkBufferCreateInfo bufferCreateInfo{};
   bufferCreateInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-  bufferCreateInfo.size = requestedSize;
+  bufferCreateInfo.size = targetCapacity;
   bufferCreateInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                           VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                          VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   bufferCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
   VkResult result =
@@ -3474,64 +3719,96 @@ bool ensure_shared_host_buffer(VulkanSharedContext &context,
   context.vkGetBufferMemoryRequirements(context.device, hostBuffer.buffer,
                                         &memoryRequirements);
 
-  uint32_t memoryTypeIndex = 0;
-  const VkMemoryPropertyFlags preferredFlags =
-      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+  uint32_t preferredMemoryTypeIndex = 0;
+  uint32_t fallbackMemoryTypeIndex = 0;
   const VkMemoryPropertyFlags fallbackFlags =
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-  if (!find_memory_type_index(context.memoryProperties,
-                              memoryRequirements.memoryTypeBits,
-                              preferredFlags, memoryTypeIndex) &&
-      !find_memory_type_index(context.memoryProperties,
-                              memoryRequirements.memoryTypeBits,
-                              fallbackFlags, memoryTypeIndex)) {
+  const VkMemoryPropertyFlags preferredFlags =
+      should_prefer_device_local_host_memory(label, targetCapacity)
+          ? (fallbackFlags | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+          : fallbackFlags;
+  const bool hasPreferredMemoryType =
+      find_memory_type_index(context.memoryProperties,
+                             memoryRequirements.memoryTypeBits,
+                             preferredFlags, preferredMemoryTypeIndex);
+  const bool hasFallbackMemoryType =
+      find_memory_type_index(context.memoryProperties,
+                             memoryRequirements.memoryTypeBits,
+                             fallbackFlags, fallbackMemoryTypeIndex);
+  if (!hasPreferredMemoryType && !hasFallbackMemoryType) {
     outError = std::string(label) +
                ": failed to find a host-visible coherent memory type.";
     context.release_host_buffer(hostBuffer);
     return false;
   }
 
-  VkMemoryAllocateInfo allocateInfo{};
-  allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-  allocateInfo.allocationSize = memoryRequirements.size;
-  allocateInfo.memoryTypeIndex = memoryTypeIndex;
+  auto allocate_and_map_host_buffer = [&](uint32_t memoryTypeIndex,
+                                          bool usingFallbackMemoryType)
+      -> bool {
+    VkMemoryAllocateInfo allocateInfo{};
+    allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocateInfo.allocationSize = memoryRequirements.size;
+    allocateInfo.memoryTypeIndex = memoryTypeIndex;
 
-  result = context.vkAllocateMemory(context.device, &allocateInfo, nullptr,
-                                    &hostBuffer.memory);
-  if (result != VK_SUCCESS) {
-    std::ostringstream stream;
-    stream << label << ": vkAllocateMemory failed (VkResult " << result
-           << ").";
-    outError = stream.str();
-    context.release_host_buffer(hostBuffer);
+    VkResult allocateResult =
+        context.vkAllocateMemory(context.device, &allocateInfo, nullptr,
+                                 &hostBuffer.memory);
+    if (allocateResult != VK_SUCCESS) {
+      std::ostringstream stream;
+      stream << label << ": vkAllocateMemory failed (VkResult "
+             << allocateResult << ")";
+      if (usingFallbackMemoryType) {
+        stream << " after retrying with non-device-local host memory";
+      }
+      stream << ".";
+      outError = stream.str();
+      context.release_host_buffer(hostBuffer);
+      return false;
+    }
+
+    VkResult bindResult = context.vkBindBufferMemory(context.device,
+                                                     hostBuffer.buffer,
+                                                     hostBuffer.memory, 0);
+    if (bindResult != VK_SUCCESS) {
+      std::ostringstream stream;
+      stream << label << ": vkBindBufferMemory failed (VkResult " << bindResult
+             << ").";
+      outError = stream.str();
+      context.release_host_buffer(hostBuffer);
+      return false;
+    }
+
+    VkResult mapResult =
+        context.vkMapMemory(context.device, hostBuffer.memory, 0,
+                            memoryRequirements.size, 0, &hostBuffer.mapped);
+    if (mapResult != VK_SUCCESS || hostBuffer.mapped == nullptr) {
+      std::ostringstream stream;
+      stream << label << ": vkMapMemory failed (VkResult " << mapResult
+             << ").";
+      outError = stream.str();
+      context.release_host_buffer(hostBuffer);
+      return false;
+    }
+
+    return true;
+  };
+
+  bool allocated = false;
+  if (hasPreferredMemoryType) {
+    allocated =
+        allocate_and_map_host_buffer(preferredMemoryTypeIndex, false);
+  }
+  if (!allocated && hasFallbackMemoryType &&
+      (!hasPreferredMemoryType ||
+       fallbackMemoryTypeIndex != preferredMemoryTypeIndex)) {
+    allocated = allocate_and_map_host_buffer(fallbackMemoryTypeIndex, true);
+  }
+  if (!allocated) {
     return false;
   }
 
-  result = context.vkBindBufferMemory(context.device, hostBuffer.buffer,
-                                      hostBuffer.memory, 0);
-  if (result != VK_SUCCESS) {
-    std::ostringstream stream;
-    stream << label << ": vkBindBufferMemory failed (VkResult " << result
-           << ").";
-    outError = stream.str();
-    context.release_host_buffer(hostBuffer);
-    return false;
-  }
-
-  result = context.vkMapMemory(context.device, hostBuffer.memory, 0,
-                               memoryRequirements.size, 0, &hostBuffer.mapped);
-  if (result != VK_SUCCESS || hostBuffer.mapped == nullptr) {
-    std::ostringstream stream;
-    stream << label << ": vkMapMemory failed (VkResult " << result << ").";
-    outError = stream.str();
-    context.release_host_buffer(hostBuffer);
-    return false;
-  }
-
-  hostBuffer.capacity = requestedSize;
+  hostBuffer.capacity = targetCapacity;
   outError.clear();
   return true;
 }
@@ -3552,11 +3829,14 @@ bool ensure_shared_device_buffer(VulkanSharedContext &context,
     return true;
   }
 
+  const VkDeviceSize previousCapacity = deviceBuffer.capacity;
+  const VkDeviceSize targetCapacity =
+      compute_shared_buffer_capacity(requestedSize, previousCapacity);
   context.release_device_buffer(deviceBuffer);
 
   VkBufferCreateInfo bufferCreateInfo{};
   bufferCreateInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-  bufferCreateInfo.size = requestedSize;
+  bufferCreateInfo.size = targetCapacity;
   bufferCreateInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                            VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -3615,7 +3895,7 @@ bool ensure_shared_device_buffer(VulkanSharedContext &context,
     return false;
   }
 
-  deviceBuffer.capacity = requestedSize;
+  deviceBuffer.capacity = targetCapacity;
   outError.clear();
   return true;
 }
@@ -3857,7 +4137,7 @@ bool initialize_vulkan_shared_context(VulkanSharedContext &context,
     if (context.surfaceWorkDescriptorPool == VK_NULL_HANDLE) {
       VkDescriptorPoolSize poolSize{};
       poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-      poolSize.descriptorCount = 24;
+      poolSize.descriptorCount = 40;
 
       VkDescriptorPoolCreateInfo poolInfo{};
       poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -4437,7 +4717,6 @@ bool initialize_vulkan_shared_context(VulkanSharedContext &context,
       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   activeVoxelCompactBindings[2].descriptorCount = 1;
   activeVoxelCompactBindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
   VkDescriptorSetLayoutBinding activeVoxelPairFillBindings[6]{};
   for (uint32_t i = 0; i < 6; ++i) {
     activeVoxelPairFillBindings[i].binding = i;
@@ -4557,7 +4836,7 @@ bool initialize_vulkan_shared_context(VulkanSharedContext &context,
   surfaceCellCompactBindings[3].descriptorCount = 1;
   surfaceCellCompactBindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-  VkDescriptorSetLayoutBinding surfaceTriangleCompactBindings[5]{};
+  VkDescriptorSetLayoutBinding surfaceTriangleCompactBindings[6]{};
   surfaceTriangleCompactBindings[0].binding = 0;
   surfaceTriangleCompactBindings[0].descriptorType =
       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -4583,6 +4862,11 @@ bool initialize_vulkan_shared_context(VulkanSharedContext &context,
       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   surfaceTriangleCompactBindings[4].descriptorCount = 1;
   surfaceTriangleCompactBindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  surfaceTriangleCompactBindings[5].binding = 5;
+  surfaceTriangleCompactBindings[5].descriptorType =
+      VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  surfaceTriangleCompactBindings[5].descriptorCount = 1;
+  surfaceTriangleCompactBindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
   VkDescriptorSetLayoutBinding denseSurfaceMeshBindings[4]{};
   denseSurfaceMeshBindings[0].binding = 0;
@@ -4692,11 +4976,11 @@ bool initialize_vulkan_shared_context(VulkanSharedContext &context,
           context.surfaceCellCompactPipelineLayout,
           context.surfaceCellCompactPipeline,
           "surface-cell compaction pipeline") ||
-      !create_shared_compute_pipeline(
-          surfaceTriangleCompactBindings, 5,
-          sizeof(SurfaceMeshPushConstants),
-          surfaceTriangleCompactShaderSpirv,
-          context.surfaceTriangleCompactDescriptorSetLayout,
+        !create_shared_compute_pipeline(
+            surfaceTriangleCompactBindings, 6,
+            sizeof(SurfaceMeshPushConstants),
+            surfaceTriangleCompactShaderSpirv,
+            context.surfaceTriangleCompactDescriptorSetLayout,
           context.surfaceTriangleCompactPipelineLayout,
           context.surfaceTriangleCompactPipeline,
           "surface-triangle compaction pipeline") ||
@@ -4809,7 +5093,6 @@ bool run_frost_vulkan_compute_particles(const float *inputParticles,
   VkDevice device = VK_NULL_HANDLE;
   VkQueue queue = VK_NULL_HANDLE;
   VkBuffer inputBuffer = VK_NULL_HANDLE;
-  VkBuffer outputBuffer = VK_NULL_HANDLE;
   VkBuffer velocityBuffer = VK_NULL_HANDLE;
   VkBuffer minBoundsBuffer = VK_NULL_HANDLE;
   VkBuffer maxBoundsBuffer = VK_NULL_HANDLE;
@@ -4818,7 +5101,6 @@ bool run_frost_vulkan_compute_particles(const float *inputParticles,
   VkBuffer activeVoxelParticleIndexBuffer = VK_NULL_HANDLE;
   VkBuffer voxelScalarFieldBuffer = VK_NULL_HANDLE;
   VkDeviceMemory inputMemory = VK_NULL_HANDLE;
-  VkDeviceMemory outputMemory = VK_NULL_HANDLE;
   VkDeviceMemory minBoundsMemory = VK_NULL_HANDLE;
   VkDeviceMemory maxBoundsMemory = VK_NULL_HANDLE;
   VkDeviceMemory voxelCoverageMemory = VK_NULL_HANDLE;
@@ -4932,9 +5214,6 @@ bool run_frost_vulkan_compute_particles(const float *inputParticles,
   auto vkEndCommandBuffer = sharedContext.vkEndCommandBuffer;
   auto vkQueueSubmit = sharedContext.vkQueueSubmit;
   VkResult result = VK_SUCCESS;
-  descriptorSetLayout = sharedContext.particleDescriptorSetLayout;
-  pipelineLayout = sharedContext.particlePipelineLayout;
-  pipeline = sharedContext.particlePipeline;
   coverageDescriptorSetLayout = sharedContext.coverageDescriptorSetLayout;
   coveragePipelineLayout = sharedContext.coveragePipelineLayout;
   coveragePipeline = sharedContext.coveragePipeline;
@@ -4956,10 +5235,6 @@ bool run_frost_vulkan_compute_particles(const float *inputParticles,
                                  bufferSize, "particle input buffer",
                                  outError) ||
       !ensure_shared_host_buffer(sharedContext,
-                                 sharedContext.particleOutputBuffer,
-                                 bufferSize, "particle output buffer",
-                                 outError) ||
-      !ensure_shared_host_buffer(sharedContext,
                                  sharedContext.particleVelocityBuffer,
                                  bufferSize, "particle velocity buffer",
                                  outError) ||
@@ -4975,13 +5250,15 @@ bool run_frost_vulkan_compute_particles(const float *inputParticles,
   }
 
   inputBuffer = sharedContext.particleInputBuffer.buffer;
-  outputBuffer = sharedContext.particleOutputBuffer.buffer;
   velocityBuffer = sharedContext.particleVelocityBuffer.buffer;
   minBoundsBuffer = sharedContext.particleMinBoundsBuffer.buffer;
   maxBoundsBuffer = sharedContext.particleMaxBoundsBuffer.buffer;
   std::memcpy(sharedContext.particleInputBuffer.mapped, inputParticles,
               static_cast<size_t>(bufferSize));
-  if (inputVelocities) {
+  const bool useVelocityBuffer =
+      inputVelocities != nullptr &&
+      settings.fieldMode == VulkanScalarFieldMode::anisotropic_velocity;
+  if (useVelocityBuffer) {
     std::memcpy(sharedContext.particleVelocityBuffer.mapped, inputVelocities,
                 static_cast<size_t>(bufferSize));
     if (settings.retainParticleData) {
@@ -4989,124 +5266,13 @@ bool run_frost_vulkan_compute_particles(const float *inputParticles,
       std::memcpy(outResult.velocities.data(), inputVelocities,
                   static_cast<size_t>(bufferSize));
     }
-  } else {
-    std::memset(sharedContext.particleVelocityBuffer.mapped, 0,
-                static_cast<size_t>(bufferSize));
-  }
-
-  VkDescriptorSet descriptorSet = sharedContext.particleDescriptorSet;
-  VkCommandBuffer commandBuffer = sharedContext.particleCommandBuffer;
-  if (descriptorSet == VK_NULL_HANDLE || commandBuffer == VK_NULL_HANDLE) {
-    return fail(
-        "Shared Vulkan particle compute resources are unavailable.");
-  }
-
-  VkDescriptorBufferInfo bufferInfos[5]{};
-  bufferInfos[0].buffer = inputBuffer;
-  bufferInfos[0].offset = 0;
-  bufferInfos[0].range = bufferSize;
-  bufferInfos[1].buffer = outputBuffer;
-  bufferInfos[1].offset = 0;
-  bufferInfos[1].range = bufferSize;
-  bufferInfos[2].buffer = minBoundsBuffer;
-  bufferInfos[2].offset = 0;
-  bufferInfos[2].range = voxelBoundsBufferSize;
-  bufferInfos[3].buffer = maxBoundsBuffer;
-  bufferInfos[3].offset = 0;
-  bufferInfos[3].range = voxelBoundsBufferSize;
-  bufferInfos[4].buffer = velocityBuffer;
-  bufferInfos[4].offset = 0;
-  bufferInfos[4].range = bufferSize;
-
-  VkWriteDescriptorSet writes[5]{};
-  for (uint32_t i = 0; i < 5; ++i) {
-    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[i].dstSet = descriptorSet;
-    writes[i].dstBinding = i;
-    writes[i].descriptorCount = 1;
-    writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[i].pBufferInfo = &bufferInfos[i];
-  }
-  vkUpdateDescriptorSets(device, 5, writes, 0, nullptr);
-
-  VkCommandBufferBeginInfo beginInfo{};
-  beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  result = vkBeginCommandBuffer(commandBuffer, &beginInfo);
-  if (result != VK_SUCCESS) {
-    std::ostringstream stream;
-    stream << "vkBeginCommandBuffer failed (VkResult " << result << ").";
-    return fail(stream.str());
-  }
-
-  vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-  vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                          pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
-
-  PushConstants pushConstants{};
-  pushConstants.particleCount = static_cast<uint32_t>(particleCount);
-  pushConstants.planningRadiusScale = settings.planningRadiusScale;
-  pushConstants.voxelLength = settings.voxelLength;
-  pushConstants.fieldMode = static_cast<uint32_t>(settings.fieldMode);
-  pushConstants.anisotropyMaxScale = settings.anisotropyMaxScale;
-  pushConstants.kernelSupportRadius = settings.kernelSupportRadius;
-  pushConstants.useVelocityBuffer = inputVelocities != nullptr ? 1u : 0u;
-  vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-                     0, sizeof(PushConstants), &pushConstants);
-
-  const uint32_t workgroupCount =
-      static_cast<uint32_t>((particleCount + 63) / 64);
-  vkCmdDispatch(commandBuffer, workgroupCount, 1, 1);
-
-  VkMemoryBarrier memoryBarrier{};
-  memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-  memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-  memoryBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-  vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                       VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &memoryBarrier, 0,
-                       nullptr, 0, nullptr);
-
-  result = vkEndCommandBuffer(commandBuffer);
-  if (result != VK_SUCCESS) {
-    std::ostringstream stream;
-    stream << "vkEndCommandBuffer failed (VkResult " << result << ").";
-    return fail(stream.str());
-  }
-
-  VkSubmitInfo submitInfo{};
-  submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  submitInfo.commandBufferCount = 1;
-  submitInfo.pCommandBuffers = &commandBuffer;
-
-  result = vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
-  if (result != VK_SUCCESS) {
-    std::ostringstream stream;
-    stream << "vkQueueSubmit failed (VkResult " << result << ").";
-    return fail(stream.str());
-  }
-
-  result = vkQueueWaitIdle(queue);
-  if (result != VK_SUCCESS) {
-    std::ostringstream stream;
-    stream << "vkQueueWaitIdle failed (VkResult " << result << ").";
-    return fail(stream.str());
   }
 
   if (settings.retainParticleData) {
     outResult.particles.resize(particleCount * 4);
-    std::memcpy(outResult.particles.data(),
-                sharedContext.particleOutputBuffer.mapped,
+    std::memcpy(outResult.particles.data(), inputParticles,
                 static_cast<size_t>(bufferSize));
   }
-
-  outResult.minVoxelBounds.resize(particleCount * 4);
-  std::memcpy(outResult.minVoxelBounds.data(),
-              sharedContext.particleMinBoundsBuffer.mapped,
-              static_cast<size_t>(voxelBoundsBufferSize));
-
-  outResult.maxVoxelBoundsExclusive.resize(particleCount * 4);
-  std::memcpy(outResult.maxVoxelBoundsExclusive.data(),
-              sharedContext.particleMaxBoundsBuffer.mapped,
-              static_cast<size_t>(voxelBoundsBufferSize));
 
   int32_t domainMinX = 0;
   int32_t domainMinY = 0;
@@ -5114,11 +5280,18 @@ bool run_frost_vulkan_compute_particles(const float *inputParticles,
   int32_t domainMaxX = 0;
   int32_t domainMaxY = 0;
   int32_t domainMaxZ = 0;
-  if (reduce_particle_voxel_bounds(outResult.minVoxelBounds,
-                                   outResult.maxVoxelBoundsExclusive,
-                                   particleCount, domainMinX, domainMinY,
-                                   domainMinZ, domainMaxX, domainMaxY,
-                                   domainMaxZ)) {
+  std::vector<int32_t> *materializedMinBounds =
+      settings.retainParticleBounds ? &outResult.minVoxelBounds : nullptr;
+  std::vector<int32_t> *materializedMaxBounds =
+      settings.retainParticleBounds ? &outResult.maxVoxelBoundsExclusive
+                                    : nullptr;
+  if (prepare_vulkan_particle_bounds_cpu(
+          inputParticles, useVelocityBuffer ? inputVelocities : nullptr,
+          particleCount, settings,
+          static_cast<int32_t *>(sharedContext.particleMinBoundsBuffer.mapped),
+          static_cast<int32_t *>(sharedContext.particleMaxBoundsBuffer.mapped),
+          materializedMinBounds, materializedMaxBounds, domainMinX, domainMinY,
+          domainMinZ, domainMaxX, domainMaxY, domainMaxZ)) {
     domainMinX -= 1;
     domainMinY -= 1;
     domainMinZ -= 1;
@@ -5192,137 +5365,113 @@ bool run_frost_vulkan_compute_particles(const float *inputParticles,
           vkUpdateDescriptorSets(device, 3, coverageWrites, 0, nullptr);
         }
 
-        if (coverageReady) {
-            VkCommandBuffer coverageCommandBuffer =
-                sharedContext.coverageCommandBuffer;
+        uint32_t maxCoverage = 0;
+        uint64_t coveredParticleVoxelPairs = 0;
+        std::vector<uint32_t> activeVoxelIndices;
+        activeVoxelIndices.reserve(
+            static_cast<std::size_t>(std::min<uint64_t>(voxelCount, 65536ull)));
 
-            if (coverageReady) {
-              VkCommandBufferBeginInfo coverageBeginInfo{};
-              coverageBeginInfo.sType =
-                  VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-              coverageReady = vkBeginCommandBuffer(coverageCommandBuffer,
-                                                   &coverageBeginInfo) ==
-                              VK_SUCCESS;
-            }
+        const VkDeviceSize activeVoxelIndexCompactionBufferSize =
+            static_cast<VkDeviceSize>(voxelCount * sizeof(uint32_t));
+        const VkDeviceSize activeVoxelStatsBufferSize =
+            static_cast<VkDeviceSize>(4u * sizeof(uint32_t));
+        bool gpuActiveVoxelCompactionReady =
+            coverageReady &&
+            voxelCount <= std::numeric_limits<uint32_t>::max() &&
+            ensure_shared_host_buffer(
+                sharedContext, sharedContext.activeVoxelIndexBuffer,
+                activeVoxelIndexCompactionBufferSize,
+                "active voxel-index compaction buffer", outError) &&
+            ensure_shared_host_buffer(
+                sharedContext, sharedContext.activeVoxelStatsBuffer,
+                activeVoxelStatsBufferSize, "active voxel-stats buffer",
+                outError) &&
+            sharedContext.activeVoxelCompactDescriptorSetLayout !=
+                VK_NULL_HANDLE &&
+            sharedContext.activeVoxelCompactPipelineLayout != VK_NULL_HANDLE &&
+            sharedContext.activeVoxelCompactPipeline != VK_NULL_HANDLE &&
+            sharedContext.activeVoxelCompactDescriptorSet != VK_NULL_HANDLE;
 
-            if (coverageReady) {
-              vkCmdBindPipeline(coverageCommandBuffer,
-                                VK_PIPELINE_BIND_POINT_COMPUTE,
-                                coveragePipeline);
-              vkCmdBindDescriptorSets(coverageCommandBuffer,
-                                      VK_PIPELINE_BIND_POINT_COMPUTE,
-                                      coveragePipelineLayout, 0, 1,
-                                      &coverageDescriptorSet, 0, nullptr);
+        if (gpuActiveVoxelCompactionReady) {
+          std::memset(sharedContext.activeVoxelStatsBuffer.mapped, 0,
+                      static_cast<size_t>(activeVoxelStatsBufferSize));
 
-              CoveragePushConstants coveragePushConstants{};
-              coveragePushConstants.particleCount =
-                  static_cast<uint32_t>(particleCount);
-              coveragePushConstants.domainMinX = domainMinX;
-              coveragePushConstants.domainMinY = domainMinY;
-              coveragePushConstants.domainMinZ = domainMinZ;
-              coveragePushConstants.domainDimX = static_cast<int32_t>(domainDimX);
-              coveragePushConstants.domainDimY = static_cast<int32_t>(domainDimY);
-              coveragePushConstants.domainDimZ = static_cast<int32_t>(domainDimZ);
-              vkCmdPushConstants(coverageCommandBuffer, coveragePipelineLayout,
-                                 VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                 sizeof(CoveragePushConstants),
-                                 &coveragePushConstants);
-              vkCmdDispatch(coverageCommandBuffer, workgroupCount, 1, 1);
+          VkDescriptorBufferInfo compactBufferInfos[3]{};
+          compactBufferInfos[0].buffer = voxelCoverageBuffer;
+          compactBufferInfos[0].offset = 0;
+          compactBufferInfos[0].range = coverageBufferSize;
+          compactBufferInfos[1].buffer = sharedContext.activeVoxelIndexBuffer.buffer;
+          compactBufferInfos[1].offset = 0;
+          compactBufferInfos[1].range = activeVoxelIndexCompactionBufferSize;
+          compactBufferInfos[2].buffer = sharedContext.activeVoxelStatsBuffer.buffer;
+          compactBufferInfos[2].offset = 0;
+          compactBufferInfos[2].range = activeVoxelStatsBufferSize;
 
-              VkMemoryBarrier coverageMemoryBarrier{};
-              coverageMemoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-              coverageMemoryBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-              coverageMemoryBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-              vkCmdPipelineBarrier(
-                  coverageCommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                  VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &coverageMemoryBarrier, 0,
-                  nullptr, 0, nullptr);
-
-              coverageReady =
-                  vkEndCommandBuffer(coverageCommandBuffer) == VK_SUCCESS;
-            }
-
-            if (coverageReady) {
-              VkSubmitInfo coverageSubmitInfo{};
-              coverageSubmitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-              coverageSubmitInfo.commandBufferCount = 1;
-              coverageSubmitInfo.pCommandBuffers = &coverageCommandBuffer;
-              coverageReady =
-                  vkQueueSubmit(queue, 1, &coverageSubmitInfo,
-                                VK_NULL_HANDLE) == VK_SUCCESS &&
-                  vkQueueWaitIdle(queue) == VK_SUCCESS;
-            }
+          VkWriteDescriptorSet compactWrites[3]{};
+          for (uint32_t i = 0; i < 3; ++i) {
+            compactWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            compactWrites[i].dstSet = sharedContext.activeVoxelCompactDescriptorSet;
+            compactWrites[i].dstBinding = i;
+            compactWrites[i].descriptorCount = 1;
+            compactWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            compactWrites[i].pBufferInfo = &compactBufferInfos[i];
+          }
+          vkUpdateDescriptorSets(device, 3, compactWrites, 0, nullptr);
         }
 
         if (coverageReady) {
-          uint32_t maxCoverage = 0;
-          uint64_t coveredParticleVoxelPairs = 0;
-          std::vector<uint32_t> activeVoxelIndices;
-          activeVoxelIndices.reserve(
-              static_cast<std::size_t>(std::min<uint64_t>(voxelCount, 65536ull)));
+          VkCommandBuffer coverageCommandBuffer =
+              sharedContext.coverageCommandBuffer;
 
-          const VkDeviceSize activeVoxelIndexCompactionBufferSize =
-              static_cast<VkDeviceSize>(voxelCount * sizeof(uint32_t));
-          const VkDeviceSize activeVoxelStatsBufferSize =
-              static_cast<VkDeviceSize>(4u * sizeof(uint32_t));
-          bool gpuActiveVoxelCompactionReady =
-              voxelCount <= std::numeric_limits<uint32_t>::max() &&
-              ensure_shared_host_buffer(
-                  sharedContext, sharedContext.activeVoxelIndexBuffer,
-                  activeVoxelIndexCompactionBufferSize,
-                  "active voxel-index compaction buffer", outError) &&
-              ensure_shared_host_buffer(
-                  sharedContext, sharedContext.activeVoxelStatsBuffer,
-                  activeVoxelStatsBufferSize, "active voxel-stats buffer",
-                  outError) &&
-              sharedContext.activeVoxelCompactDescriptorSetLayout !=
-                  VK_NULL_HANDLE &&
-              sharedContext.activeVoxelCompactPipelineLayout != VK_NULL_HANDLE &&
-              sharedContext.activeVoxelCompactPipeline != VK_NULL_HANDLE &&
-              sharedContext.activeVoxelCompactDescriptorSet != VK_NULL_HANDLE &&
-              sharedContext.activeVoxelCompactCommandBuffer != VK_NULL_HANDLE;
+          VkCommandBufferBeginInfo coverageBeginInfo{};
+          coverageBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+          coverageReady =
+              vkBeginCommandBuffer(coverageCommandBuffer, &coverageBeginInfo) ==
+              VK_SUCCESS;
 
-          if (gpuActiveVoxelCompactionReady) {
-            std::memset(sharedContext.activeVoxelStatsBuffer.mapped, 0,
-                        static_cast<size_t>(activeVoxelStatsBufferSize));
+          if (coverageReady) {
+            const uint32_t particleWorkgroupCount =
+                static_cast<uint32_t>((particleCount + 63) / 64);
+            vkCmdBindPipeline(coverageCommandBuffer,
+                              VK_PIPELINE_BIND_POINT_COMPUTE, coveragePipeline);
+            vkCmdBindDescriptorSets(coverageCommandBuffer,
+                                    VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    coveragePipelineLayout, 0, 1,
+                                    &coverageDescriptorSet, 0, nullptr);
 
-            VkDescriptorBufferInfo compactBufferInfos[3]{};
-            compactBufferInfos[0].buffer = voxelCoverageBuffer;
-            compactBufferInfos[0].offset = 0;
-            compactBufferInfos[0].range = coverageBufferSize;
-            compactBufferInfos[1].buffer = sharedContext.activeVoxelIndexBuffer.buffer;
-            compactBufferInfos[1].offset = 0;
-            compactBufferInfos[1].range = activeVoxelIndexCompactionBufferSize;
-            compactBufferInfos[2].buffer = sharedContext.activeVoxelStatsBuffer.buffer;
-            compactBufferInfos[2].offset = 0;
-            compactBufferInfos[2].range = activeVoxelStatsBufferSize;
-
-            VkWriteDescriptorSet compactWrites[3]{};
-            for (uint32_t i = 0; i < 3; ++i) {
-              compactWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-              compactWrites[i].dstSet = sharedContext.activeVoxelCompactDescriptorSet;
-              compactWrites[i].dstBinding = i;
-              compactWrites[i].descriptorCount = 1;
-              compactWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-              compactWrites[i].pBufferInfo = &compactBufferInfos[i];
-            }
-            vkUpdateDescriptorSets(device, 3, compactWrites, 0, nullptr);
-
-            VkCommandBuffer compactCommandBuffer =
-                sharedContext.activeVoxelCompactCommandBuffer;
-            VkCommandBufferBeginInfo compactBeginInfo{};
-            compactBeginInfo.sType =
-                VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            gpuActiveVoxelCompactionReady =
-                vkBeginCommandBuffer(compactCommandBuffer, &compactBeginInfo) ==
-                VK_SUCCESS;
+            CoveragePushConstants coveragePushConstants{};
+            coveragePushConstants.particleCount =
+                static_cast<uint32_t>(particleCount);
+            coveragePushConstants.domainMinX = domainMinX;
+            coveragePushConstants.domainMinY = domainMinY;
+            coveragePushConstants.domainMinZ = domainMinZ;
+            coveragePushConstants.domainDimX = static_cast<int32_t>(domainDimX);
+            coveragePushConstants.domainDimY = static_cast<int32_t>(domainDimY);
+            coveragePushConstants.domainDimZ = static_cast<int32_t>(domainDimZ);
+            vkCmdPushConstants(coverageCommandBuffer, coveragePipelineLayout,
+                               VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                               sizeof(CoveragePushConstants),
+                               &coveragePushConstants);
+            vkCmdDispatch(coverageCommandBuffer, particleWorkgroupCount, 1, 1);
 
             if (gpuActiveVoxelCompactionReady) {
-              vkCmdBindPipeline(compactCommandBuffer,
+              VkMemoryBarrier coverageToCompactBarrier{};
+              coverageToCompactBarrier.sType =
+                  VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+              coverageToCompactBarrier.srcAccessMask =
+                  VK_ACCESS_SHADER_WRITE_BIT;
+              coverageToCompactBarrier.dstAccessMask =
+                  VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+              vkCmdPipelineBarrier(
+                  coverageCommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                  &coverageToCompactBarrier, 0, nullptr, 0, nullptr);
+
+              vkCmdBindPipeline(coverageCommandBuffer,
                                 VK_PIPELINE_BIND_POINT_COMPUTE,
                                 sharedContext.activeVoxelCompactPipeline);
               vkCmdBindDescriptorSets(
-                  compactCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                  coverageCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                   sharedContext.activeVoxelCompactPipelineLayout, 0, 1,
                   &sharedContext.activeVoxelCompactDescriptorSet, 0, nullptr);
 
@@ -5330,7 +5479,7 @@ bool run_frost_vulkan_compute_particles(const float *inputParticles,
               compactPushConstants.voxelCount =
                   static_cast<uint32_t>(voxelCount);
               vkCmdPushConstants(
-                  compactCommandBuffer,
+                  coverageCommandBuffer,
                   sharedContext.activeVoxelCompactPipelineLayout,
                   VK_SHADER_STAGE_COMPUTE_BIT, 0,
                   sizeof(ActiveVoxelCompactPushConstants),
@@ -5338,57 +5487,57 @@ bool run_frost_vulkan_compute_particles(const float *inputParticles,
 
               const uint32_t compactWorkgroupCount =
                   static_cast<uint32_t>((voxelCount + 63ull) / 64ull);
-              vkCmdDispatch(compactCommandBuffer, compactWorkgroupCount, 1, 1);
-
-              VkMemoryBarrier compactMemoryBarrier{};
-              compactMemoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-              compactMemoryBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-              compactMemoryBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-              vkCmdPipelineBarrier(
-                  compactCommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                  VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &compactMemoryBarrier, 0,
-                  nullptr, 0, nullptr);
-
-              gpuActiveVoxelCompactionReady =
-                  vkEndCommandBuffer(compactCommandBuffer) == VK_SUCCESS;
+              vkCmdDispatch(coverageCommandBuffer, compactWorkgroupCount, 1, 1);
             }
 
-            if (gpuActiveVoxelCompactionReady) {
-              VkSubmitInfo compactSubmitInfo{};
-              compactSubmitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-              compactSubmitInfo.commandBufferCount = 1;
-              compactSubmitInfo.pCommandBuffers = &compactCommandBuffer;
-              gpuActiveVoxelCompactionReady =
-                  vkQueueSubmit(queue, 1, &compactSubmitInfo,
-                                VK_NULL_HANDLE) == VK_SUCCESS &&
-                  vkQueueWaitIdle(queue) == VK_SUCCESS;
-            }
+            VkMemoryBarrier coverageReadbackBarrier{};
+            coverageReadbackBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            coverageReadbackBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            coverageReadbackBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            vkCmdPipelineBarrier(
+                coverageCommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &coverageReadbackBarrier, 0,
+                nullptr, 0, nullptr);
 
-            if (gpuActiveVoxelCompactionReady) {
-              const uint32_t *stats =
-                  static_cast<const uint32_t *>(
-                      sharedContext.activeVoxelStatsBuffer.mapped);
-              const uint32_t activeVoxelCountFromGpu = stats[0];
-              maxCoverage = stats[1];
-              const bool pairCountOverflowed = stats[3] != 0u;
-              coveredParticleVoxelPairs =
-                  pairCountOverflowed
-                      ? std::numeric_limits<uint64_t>::max()
-                      : static_cast<uint64_t>(stats[2]);
-              if (activeVoxelCountFromGpu > 0u) {
-                activeVoxelIndices.resize(activeVoxelCountFromGpu);
-                std::memcpy(activeVoxelIndices.data(),
-                            sharedContext.activeVoxelIndexBuffer.mapped,
-                            static_cast<size_t>(activeVoxelCountFromGpu) *
-                                sizeof(uint32_t));
-                if (settings.sortActiveVoxelIndices &&
-                    activeVoxelIndices.size() > 1u) {
-                  std::sort(activeVoxelIndices.begin(),
-                            activeVoxelIndices.end());
-                }
-              }
+            coverageReady =
+                vkEndCommandBuffer(coverageCommandBuffer) == VK_SUCCESS;
+          }
+
+          if (coverageReady) {
+            VkSubmitInfo coverageSubmitInfo{};
+            coverageSubmitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            coverageSubmitInfo.commandBufferCount = 1;
+            coverageSubmitInfo.pCommandBuffers = &coverageCommandBuffer;
+            coverageReady =
+                vkQueueSubmit(queue, 1, &coverageSubmitInfo, VK_NULL_HANDLE) ==
+                    VK_SUCCESS &&
+                vkQueueWaitIdle(queue) == VK_SUCCESS;
+          }
+        }
+
+        if (coverageReady && gpuActiveVoxelCompactionReady) {
+          const uint32_t *stats = static_cast<const uint32_t *>(
+              sharedContext.activeVoxelStatsBuffer.mapped);
+          const uint32_t activeVoxelCountFromGpu = stats[0];
+          maxCoverage = stats[1];
+          const bool pairCountOverflowed = stats[3] != 0u;
+          coveredParticleVoxelPairs =
+              pairCountOverflowed ? std::numeric_limits<uint64_t>::max()
+                                  : static_cast<uint64_t>(stats[2]);
+          if (activeVoxelCountFromGpu > 0u) {
+            activeVoxelIndices.resize(activeVoxelCountFromGpu);
+            std::memcpy(activeVoxelIndices.data(),
+                        sharedContext.activeVoxelIndexBuffer.mapped,
+                        static_cast<size_t>(activeVoxelCountFromGpu) *
+                            sizeof(uint32_t));
+            if (settings.sortActiveVoxelIndices &&
+                activeVoxelIndices.size() > 1u) {
+              std::sort(activeVoxelIndices.begin(), activeVoxelIndices.end());
             }
           }
+        }
+
+        if (coverageReady) {
 
           if (settings.readbackCoverageCounts || !gpuActiveVoxelCompactionReady) {
             outResult.voxelCoverageCounts.resize(
@@ -5442,13 +5591,29 @@ bool run_frost_vulkan_compute_particles(const float *inputParticles,
           outResult.coveredParticleVoxelPairs = coveredParticleVoxelPairs;
           outResult.activeVoxelIndices = activeVoxelIndices;
 
+          const uint32_t *denseVoxelCoverageCounts = nullptr;
+          std::size_t denseVoxelCoverageCount = 0u;
+          if (!outResult.voxelCoverageCounts.empty()) {
+            denseVoxelCoverageCounts = outResult.voxelCoverageCounts.data();
+            denseVoxelCoverageCount = outResult.voxelCoverageCounts.size();
+          } else if (sharedContext.voxelCoverageBuffer.mapped != nullptr) {
+            denseVoxelCoverageCounts = static_cast<const uint32_t *>(
+                sharedContext.voxelCoverageBuffer.mapped);
+            denseVoxelCoverageCount = static_cast<std::size_t>(voxelCount);
+          }
+
           if (maxCoverage > 0 &&
               voxelCount <= kMaxVoxelScalarFieldCells) {
             const uint64_t scalarFieldWorkEstimate =
                 coveredParticleVoxelPairs;
+            const uint64_t particleFieldBudget =
+                (settings.fieldMode == VulkanScalarFieldMode::metaball ||
+                 settings.fieldMode ==
+                     VulkanScalarFieldMode::plain_marching_cubes)
+                    ? kMaxVoxelParticleDistanceEvaluationsMetaball
+                    : kMaxVoxelParticleDistanceEvaluations;
             const bool useRequestedParticleField =
-                scalarFieldWorkEstimate <=
-                kMaxVoxelParticleDistanceEvaluations;
+                scalarFieldWorkEstimate <= particleFieldBudget;
             std::vector<uint32_t> activeVoxelParticleOffsets;
             std::vector<uint32_t> activeVoxelParticleIndices;
             std::vector<int32_t> activeVoxelCompactLookup;
@@ -5456,8 +5621,10 @@ bool run_frost_vulkan_compute_particles(const float *inputParticles,
             bool useCompactedParticlePairs = false;
             bool useGpuCompactedParticlePairs = false;
             if (settings.preferGpuCompactedPairs && useRequestedParticleField &&
-                build_active_voxel_lookup_and_offsets(
-                    activeVoxelIndices, outResult.voxelCoverageCounts,
+                denseVoxelCoverageCounts != nullptr &&
+                build_active_voxel_lookup_and_offsets_from_dense_counts(
+                    activeVoxelIndices, denseVoxelCoverageCounts,
+                    denseVoxelCoverageCount,
                     static_cast<int32_t>(domainDimX),
                     static_cast<int32_t>(domainDimY),
                     static_cast<int32_t>(domainDimZ),
@@ -5467,7 +5634,16 @@ bool run_frost_vulkan_compute_particles(const float *inputParticles,
               useCompactedParticlePairs = true;
               useGpuCompactedParticlePairs = true;
             } else if (settings.allowCpuCompactedPairs &&
+                       !outResult.minVoxelBounds.empty() &&
+                       !outResult.maxVoxelBoundsExclusive.empty() &&
                        useRequestedParticleField &&
+                       (!settings.sortActiveVoxelIndices ||
+                        activeVoxelIndices.size() <= 1u ||
+                        std::is_sorted(activeVoxelIndices.begin(),
+                                       activeVoxelIndices.end()) ||
+                        (std::sort(activeVoxelIndices.begin(),
+                                   activeVoxelIndices.end()),
+                         outResult.activeVoxelIndices = activeVoxelIndices, true)) &&
                        build_active_voxel_particle_lists(
                            particleCount, outResult.minVoxelBounds,
                            outResult.maxVoxelBoundsExclusive, domainMinX,
@@ -5578,10 +5754,10 @@ bool run_frost_vulkan_compute_particles(const float *inputParticles,
                   sharedContext.activeVoxelParticleOffsetBuffer.buffer;
               activeVoxelParticleIndexBuffer =
                   sharedContext.activeVoxelParticleIndexBuffer.buffer;
-              std::memset(sharedContext.voxelScalarFieldBuffer.mapped, 0,
-                          static_cast<size_t>(scalarFieldBufferSize));
               const float outsideField =
                   compute_vulkan_outside_field(settings);
+              std::memset(sharedContext.voxelScalarFieldBuffer.mapped, 0,
+                          static_cast<size_t>(scalarFieldBufferSize));
               float *scalarFieldMapped =
                   static_cast<float *>(sharedContext.voxelScalarFieldBuffer.mapped);
               for (std::size_t i = 0; i < static_cast<std::size_t>(voxelCount);
@@ -5634,8 +5810,6 @@ bool run_frost_vulkan_compute_particles(const float *inputParticles,
                         sharedContext.activeVoxelPairFillPipeline !=
                             VK_NULL_HANDLE &&
                         sharedContext.activeVoxelPairFillDescriptorSet !=
-                            VK_NULL_HANDLE &&
-                        sharedContext.activeVoxelPairFillCommandBuffer !=
                             VK_NULL_HANDLE;
                   }
 
@@ -5682,110 +5856,6 @@ bool run_frost_vulkan_compute_particles(const float *inputParticles,
                     }
                     vkUpdateDescriptorSets(device, 6, pairFillWrites, 0,
                                            nullptr);
-
-                    VkCommandBuffer pairFillCommandBuffer =
-                        sharedContext.activeVoxelPairFillCommandBuffer;
-                    VkCommandBufferBeginInfo pairFillBeginInfo{};
-                    pairFillBeginInfo.sType =
-                        VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-                    scalarFieldReady =
-                        vkBeginCommandBuffer(pairFillCommandBuffer,
-                                             &pairFillBeginInfo) == VK_SUCCESS;
-
-                    if (scalarFieldReady) {
-                      VkBufferCopy pairFillCopies[3]{};
-                      pairFillCopies[0].size = activeVoxelCompactLookupBufferSize;
-                      pairFillCopies[1].size = activeVoxelParticleOffsetBufferSize;
-                      pairFillCopies[2].size = activeVoxelParticleCursorBufferSize;
-                      sharedContext.vkCmdCopyBuffer(
-                          pairFillCommandBuffer,
-                          sharedContext.activeVoxelCompactLookupBuffer.buffer,
-                          sharedContext.deviceActiveVoxelCompactLookupBuffer.buffer, 1,
-                          &pairFillCopies[0]);
-                      sharedContext.vkCmdCopyBuffer(
-                          pairFillCommandBuffer,
-                          sharedContext.activeVoxelParticleOffsetBuffer.buffer,
-                          sharedContext.deviceActiveVoxelParticleOffsetBuffer.buffer, 1,
-                          &pairFillCopies[1]);
-                      sharedContext.vkCmdCopyBuffer(
-                          pairFillCommandBuffer,
-                          sharedContext.activeVoxelParticleCursorBuffer.buffer,
-                          sharedContext.deviceActiveVoxelParticleCursorBuffer.buffer, 1,
-                          &pairFillCopies[2]);
-
-                      VkMemoryBarrier pairFillUploadBarrier{};
-                      pairFillUploadBarrier.sType =
-                          VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-                      pairFillUploadBarrier.srcAccessMask =
-                          VK_ACCESS_TRANSFER_WRITE_BIT;
-                      pairFillUploadBarrier.dstAccessMask =
-                          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-                      vkCmdPipelineBarrier(
-                          pairFillCommandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
-                          &pairFillUploadBarrier, 0, nullptr, 0, nullptr);
-
-                      vkCmdBindPipeline(pairFillCommandBuffer,
-                                        VK_PIPELINE_BIND_POINT_COMPUTE,
-                                        sharedContext.activeVoxelPairFillPipeline);
-                      vkCmdBindDescriptorSets(
-                          pairFillCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                          sharedContext.activeVoxelPairFillPipelineLayout, 0, 1,
-                          &sharedContext.activeVoxelPairFillDescriptorSet, 0,
-                          nullptr);
-
-                      ActiveVoxelPairFillPushConstants pairFillPushConstants{};
-                      pairFillPushConstants.particleCount =
-                          static_cast<uint32_t>(particleCount);
-                      pairFillPushConstants.domainMinX = domainMinX;
-                      pairFillPushConstants.domainMinY = domainMinY;
-                      pairFillPushConstants.domainMinZ = domainMinZ;
-                      pairFillPushConstants.domainDimX =
-                          static_cast<int32_t>(domainDimX);
-                      pairFillPushConstants.domainDimY =
-                          static_cast<int32_t>(domainDimY);
-                      pairFillPushConstants.domainDimZ =
-                          static_cast<int32_t>(domainDimZ);
-                      vkCmdPushConstants(
-                          pairFillCommandBuffer,
-                          sharedContext.activeVoxelPairFillPipelineLayout,
-                          VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                          sizeof(ActiveVoxelPairFillPushConstants),
-                          &pairFillPushConstants);
-
-                      const uint32_t pairFillWorkgroupCount =
-                          static_cast<uint32_t>((particleCount + 63ull) / 64ull);
-                      vkCmdDispatch(pairFillCommandBuffer, pairFillWorkgroupCount,
-                                    1, 1);
-
-                      VkMemoryBarrier pairFillBarrier{};
-                      pairFillBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-                      pairFillBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-                      pairFillBarrier.dstAccessMask =
-                          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_HOST_READ_BIT;
-                      vkCmdPipelineBarrier(
-                          pairFillCommandBuffer,
-                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                              VK_PIPELINE_STAGE_HOST_BIT,
-                          0, 1, &pairFillBarrier, 0, nullptr, 0, nullptr);
-
-                      scalarFieldReady =
-                          vkEndCommandBuffer(pairFillCommandBuffer) == VK_SUCCESS;
-                    }
-
-                    if (scalarFieldReady) {
-                      VkSubmitInfo pairFillSubmitInfo{};
-                      pairFillSubmitInfo.sType =
-                          VK_STRUCTURE_TYPE_SUBMIT_INFO;
-                      pairFillSubmitInfo.commandBufferCount = 1;
-                      pairFillSubmitInfo.pCommandBuffers =
-                          &pairFillCommandBuffer;
-                      scalarFieldReady =
-                          vkQueueSubmit(queue, 1, &pairFillSubmitInfo,
-                                        VK_NULL_HANDLE) == VK_SUCCESS &&
-                          vkQueueWaitIdle(queue) == VK_SUCCESS;
-                    }
                   }
 
                   VkDescriptorSet scalarFieldDescriptorSet =
@@ -5877,6 +5947,91 @@ bool run_frost_vulkan_compute_particles(const float *inputParticles,
                     }
 
                     if (scalarFieldReady) {
+                      if (useGpuCompactedParticlePairs) {
+                        VkBufferCopy pairFillCopies[3]{};
+                        pairFillCopies[0].size = activeVoxelCompactLookupBufferSize;
+                        pairFillCopies[1].size = activeVoxelParticleOffsetBufferSize;
+                        pairFillCopies[2].size = activeVoxelParticleCursorBufferSize;
+                        sharedContext.vkCmdCopyBuffer(
+                            scalarFieldCommandBuffer,
+                            sharedContext.activeVoxelCompactLookupBuffer.buffer,
+                            sharedContext.deviceActiveVoxelCompactLookupBuffer.buffer, 1,
+                            &pairFillCopies[0]);
+                        sharedContext.vkCmdCopyBuffer(
+                            scalarFieldCommandBuffer,
+                            sharedContext.activeVoxelParticleOffsetBuffer.buffer,
+                            sharedContext.deviceActiveVoxelParticleOffsetBuffer.buffer, 1,
+                            &pairFillCopies[1]);
+                        sharedContext.vkCmdCopyBuffer(
+                            scalarFieldCommandBuffer,
+                            sharedContext.activeVoxelParticleCursorBuffer.buffer,
+                            sharedContext.deviceActiveVoxelParticleCursorBuffer.buffer, 1,
+                            &pairFillCopies[2]);
+
+                        VkMemoryBarrier pairFillUploadBarrier{};
+                        pairFillUploadBarrier.sType =
+                            VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+                        pairFillUploadBarrier.srcAccessMask =
+                            VK_ACCESS_TRANSFER_WRITE_BIT;
+                        pairFillUploadBarrier.dstAccessMask =
+                            VK_ACCESS_SHADER_READ_BIT |
+                            VK_ACCESS_SHADER_WRITE_BIT;
+                        vkCmdPipelineBarrier(
+                            scalarFieldCommandBuffer,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                            &pairFillUploadBarrier, 0, nullptr, 0, nullptr);
+
+                        vkCmdBindPipeline(
+                            scalarFieldCommandBuffer,
+                            VK_PIPELINE_BIND_POINT_COMPUTE,
+                            sharedContext.activeVoxelPairFillPipeline);
+                        vkCmdBindDescriptorSets(
+                            scalarFieldCommandBuffer,
+                            VK_PIPELINE_BIND_POINT_COMPUTE,
+                            sharedContext.activeVoxelPairFillPipelineLayout, 0,
+                            1, &sharedContext.activeVoxelPairFillDescriptorSet,
+                            0, nullptr);
+
+                        ActiveVoxelPairFillPushConstants pairFillPushConstants{};
+                        pairFillPushConstants.particleCount =
+                            static_cast<uint32_t>(particleCount);
+                        pairFillPushConstants.domainMinX = domainMinX;
+                        pairFillPushConstants.domainMinY = domainMinY;
+                        pairFillPushConstants.domainMinZ = domainMinZ;
+                        pairFillPushConstants.domainDimX =
+                            static_cast<int32_t>(domainDimX);
+                        pairFillPushConstants.domainDimY =
+                            static_cast<int32_t>(domainDimY);
+                        pairFillPushConstants.domainDimZ =
+                            static_cast<int32_t>(domainDimZ);
+                        vkCmdPushConstants(
+                            scalarFieldCommandBuffer,
+                            sharedContext.activeVoxelPairFillPipelineLayout,
+                            VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                            sizeof(ActiveVoxelPairFillPushConstants),
+                            &pairFillPushConstants);
+
+                        const uint32_t pairFillWorkgroupCount =
+                            static_cast<uint32_t>((particleCount + 63ull) / 64ull);
+                        vkCmdDispatch(scalarFieldCommandBuffer,
+                                      pairFillWorkgroupCount, 1, 1);
+
+                        VkMemoryBarrier pairFillBarrier{};
+                        pairFillBarrier.sType =
+                            VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+                        pairFillBarrier.srcAccessMask =
+                            VK_ACCESS_SHADER_WRITE_BIT;
+                        pairFillBarrier.dstAccessMask =
+                            VK_ACCESS_SHADER_READ_BIT |
+                            VK_ACCESS_SHADER_WRITE_BIT;
+                        vkCmdPipelineBarrier(
+                            scalarFieldCommandBuffer,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                            &pairFillBarrier, 0, nullptr, 0, nullptr);
+                      }
+
                       VkPipeline selectedScalarFieldPipeline =
                           scalarFieldPipeline;
                       if (settings.fieldMode ==
@@ -5915,8 +6070,23 @@ bool run_frost_vulkan_compute_particles(const float *inputParticles,
                           settings.voxelLength;
                       scalarFieldPushConstants.fieldRadiusScale =
                           settings.fieldRadiusScale;
+                      float coverageNormalization =
+                          static_cast<float>(maxCoverage);
+                      if (!useRequestedParticleField &&
+                          (settings.fieldMode ==
+                               VulkanScalarFieldMode::metaball ||
+                           settings.fieldMode ==
+                               VulkanScalarFieldMode::plain_marching_cubes) &&
+                          activeVoxelCount > 0) {
+                        const float averageCoverage =
+                            static_cast<float>(coveredParticleVoxelPairs) /
+                            static_cast<float>(activeVoxelCount);
+                        coverageNormalization = std::min(
+                            coverageNormalization,
+                            std::max(averageCoverage * 1.5f, 1.0f));
+                      }
                       scalarFieldPushConstants.inverseMaxCoverage =
-                          1.0f / static_cast<float>(maxCoverage);
+                          1.0f / std::max(coverageNormalization, 1.0f);
                       scalarFieldPushConstants.fieldThreshold =
                           settings.fieldThreshold;
                       scalarFieldPushConstants.surfaceIsoValue =
@@ -5928,7 +6098,7 @@ bool run_frost_vulkan_compute_particles(const float *inputParticles,
                       scalarFieldPushConstants.useRequestedParticleField =
                           useRequestedParticleField ? 1u : 0u;
                       scalarFieldPushConstants.useVelocityBuffer =
-                          inputVelocities != nullptr ? 1u : 0u;
+                          useVelocityBuffer ? 1u : 0u;
                       scalarFieldPushConstants.useCompactedParticlePairs =
                           useCompactedParticlePairs ? 1u : 0u;
                       vkCmdPushConstants(scalarFieldCommandBuffer,
@@ -5948,12 +6118,15 @@ bool run_frost_vulkan_compute_particles(const float *inputParticles,
                       scalarFieldMemoryBarrier.srcAccessMask =
                           VK_ACCESS_SHADER_WRITE_BIT;
                       scalarFieldMemoryBarrier.dstAccessMask =
+                          VK_ACCESS_SHADER_READ_BIT |
                           VK_ACCESS_HOST_READ_BIT;
                       vkCmdPipelineBarrier(
                           scalarFieldCommandBuffer,
                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                          VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
-                          &scalarFieldMemoryBarrier, 0, nullptr, 0, nullptr);
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                              VK_PIPELINE_STAGE_HOST_BIT,
+                          0, 1, &scalarFieldMemoryBarrier, 0, nullptr, 0,
+                          nullptr);
 
                       scalarFieldReady =
                           vkEndCommandBuffer(scalarFieldCommandBuffer) ==
@@ -6246,6 +6419,149 @@ bool run_frost_vulkan_classify_surface_cells(
   return true;
 }
 
+bool ensure_frost_vulkan_resident_surface_cells(
+    const std::vector<uint32_t> &activeCellIndices,
+    const std::vector<uint32_t> &activeCellCubeIndices,
+    std::string &outError) {
+  if (activeCellIndices.empty()) {
+    outError.clear();
+    return true;
+  }
+  if (activeCellIndices.size() != activeCellCubeIndices.size()) {
+    outError =
+        "Vulkan resident surface-cell upload requires matching index and cube-index buffers.";
+    return false;
+  }
+
+  auto &sharedContext = get_vulkan_shared_context();
+  std::lock_guard<std::mutex> lock(sharedContext.mutex);
+  if (!initialize_vulkan_shared_context(sharedContext, outError)) {
+    return false;
+  }
+
+  VkDevice device = sharedContext.device;
+  VkQueue queue = sharedContext.queue;
+  VkCommandPool commandPool = sharedContext.commandPool;
+  auto vkBeginCommandBuffer = sharedContext.vkBeginCommandBuffer;
+  auto vkCmdCopyBuffer = sharedContext.vkCmdCopyBuffer;
+  auto vkCmdPipelineBarrier = sharedContext.vkCmdPipelineBarrier;
+  auto vkEndCommandBuffer = sharedContext.vkEndCommandBuffer;
+  auto vkQueueSubmit = sharedContext.vkQueueSubmit;
+  auto vkQueueWaitIdle = sharedContext.vkQueueWaitIdle;
+  auto vkResetCommandPool = sharedContext.vkResetCommandPool;
+
+  auto cleanup = [&]() {
+    if (device != VK_NULL_HANDLE) {
+      if (queue != VK_NULL_HANDLE && vkQueueWaitIdle) {
+        vkQueueWaitIdle(queue);
+      }
+      if (commandPool != VK_NULL_HANDLE && vkResetCommandPool) {
+        vkResetCommandPool(device, commandPool, 0);
+      }
+    }
+  };
+
+  const VkDeviceSize activeCellBufferSize =
+      static_cast<VkDeviceSize>(activeCellIndices.size() * sizeof(uint32_t));
+  bool buffersReady = ensure_shared_host_buffer(
+      sharedContext, sharedContext.candidateCellIndexBuffer,
+      activeCellBufferSize, "resident surface cell-index upload buffer",
+      outError);
+  if (buffersReady) {
+    buffersReady = ensure_shared_host_buffer(
+        sharedContext, sharedContext.candidateCellCubeIndexBuffer,
+        activeCellBufferSize, "resident surface cube-index upload buffer",
+        outError);
+  }
+  if (buffersReady) {
+    buffersReady = ensure_shared_device_buffer(
+        sharedContext, sharedContext.deviceCandidateCellIndexBuffer,
+        activeCellBufferSize, "resident surface device cell-index buffer",
+        outError);
+  }
+  if (buffersReady) {
+    buffersReady = ensure_shared_device_buffer(
+        sharedContext, sharedContext.deviceCandidateCellCubeIndexBuffer,
+        activeCellBufferSize, "resident surface device cube-index buffer",
+        outError);
+  }
+  if (!buffersReady) {
+    cleanup();
+    return false;
+  }
+
+  std::memcpy(sharedContext.candidateCellIndexBuffer.mapped,
+              activeCellIndices.data(),
+              static_cast<size_t>(activeCellBufferSize));
+  std::memcpy(sharedContext.candidateCellCubeIndexBuffer.mapped,
+              activeCellCubeIndices.data(),
+              static_cast<size_t>(activeCellBufferSize));
+
+  VkCommandBuffer commandBuffer = sharedContext.surfaceCellCompactCommandBuffer;
+  if (commandBuffer == VK_NULL_HANDLE) {
+    commandBuffer = sharedContext.sparseSurfaceCellCommandBuffer;
+  }
+  if (commandBuffer == VK_NULL_HANDLE || !vkBeginCommandBuffer ||
+      !vkCmdCopyBuffer || !vkCmdPipelineBarrier || !vkEndCommandBuffer ||
+      !vkQueueSubmit || !vkQueueWaitIdle) {
+    outError =
+        "Vulkan resident surface-cell upload requires transfer command support.";
+    cleanup();
+    return false;
+  }
+
+  VkCommandBufferBeginInfo beginInfo{};
+  beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
+    outError =
+        "Failed to begin Vulkan resident surface-cell upload command buffer.";
+    cleanup();
+    return false;
+  }
+
+  VkBufferCopy copies[2]{};
+  copies[0].size = activeCellBufferSize;
+  copies[1].size = activeCellBufferSize;
+  vkCmdCopyBuffer(commandBuffer, sharedContext.candidateCellIndexBuffer.buffer,
+                  sharedContext.deviceCandidateCellIndexBuffer.buffer, 1,
+                  &copies[0]);
+  vkCmdCopyBuffer(commandBuffer,
+                  sharedContext.candidateCellCubeIndexBuffer.buffer,
+                  sharedContext.deviceCandidateCellCubeIndexBuffer.buffer, 1,
+                  &copies[1]);
+
+  VkMemoryBarrier transferBarrier{};
+  transferBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  transferBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  transferBarrier.dstAccessMask =
+      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                       &transferBarrier, 0, nullptr, 0, nullptr);
+
+  if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
+    outError =
+        "Failed to end Vulkan resident surface-cell upload command buffer.";
+    cleanup();
+    return false;
+  }
+
+  VkSubmitInfo submitInfo{};
+  submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submitInfo.commandBufferCount = 1;
+  submitInfo.pCommandBuffers = &commandBuffer;
+  if (vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS ||
+      vkQueueWaitIdle(queue) != VK_SUCCESS) {
+    outError = "Failed to submit Vulkan resident surface-cell upload.";
+    cleanup();
+    return false;
+  }
+
+  outError.clear();
+  cleanup();
+  return true;
+}
+
 bool run_frost_vulkan_classify_surface_cells_from_active_voxels(
     const VulkanParticleComputeResult &computeResult,
     std::vector<uint32_t> &outActiveCellIndices,
@@ -6341,18 +6657,6 @@ bool run_frost_vulkan_classify_surface_cells_from_active_voxels(
   }
   if (classifyReady) {
     classifyReady = ensure_shared_host_buffer(
-        sharedContext, sharedContext.candidateCellIndexBuffer,
-        compactCellIndexBufferSize, "sparse compact surface cell-index buffer",
-        outError);
-  }
-  if (classifyReady) {
-    classifyReady = ensure_shared_host_buffer(
-        sharedContext, sharedContext.candidateCellCubeIndexBuffer,
-        compactCellIndexBufferSize, "sparse compact surface cube-index buffer",
-        outError);
-  }
-  if (classifyReady) {
-    classifyReady = ensure_shared_host_buffer(
         sharedContext, sharedContext.surfaceCellStatsBuffer,
         surfaceCellStatsBufferSize, "surface-cell stats buffer", outError);
   }
@@ -6390,10 +6694,6 @@ bool run_frost_vulkan_classify_surface_cells_from_active_voxels(
               static_cast<size_t>(activeVoxelIndexBufferSize));
   std::memset(sharedContext.surfaceCellStatsBuffer.mapped, 0,
               static_cast<size_t>(surfaceCellStatsBufferSize));
-  std::memset(sharedContext.candidateCellIndexBuffer.mapped, 0,
-              static_cast<size_t>(compactCellIndexBufferSize));
-  std::memset(sharedContext.candidateCellCubeIndexBuffer.mapped, 0,
-              static_cast<size_t>(compactCellIndexBufferSize));
 
   if (sharedContext.sparseSurfaceCellDescriptorSetLayout == VK_NULL_HANDLE ||
       sharedContext.sparseSurfaceCellPipelineLayout == VK_NULL_HANDLE ||
@@ -6553,20 +6853,12 @@ bool run_frost_vulkan_classify_surface_cells_from_active_voxels(
                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
                        &compactMemoryBarrier, 0, nullptr, 0, nullptr);
 
-  VkBufferCopy compactCopies[3]{};
-  compactCopies[0].size = compactCellIndexBufferSize;
-  compactCopies[1].size = compactCellIndexBufferSize;
-  compactCopies[2].size = surfaceCellStatsBufferSize;
-  vkCmdCopyBuffer(commandBuffer, sharedContext.deviceCandidateCellIndexBuffer.buffer,
-                  sharedContext.candidateCellIndexBuffer.buffer, 1,
-                  &compactCopies[0]);
+  VkBufferCopy compactCopies[1]{};
+  compactCopies[0].size = surfaceCellStatsBufferSize;
   vkCmdCopyBuffer(commandBuffer,
-                  sharedContext.deviceCandidateCellCubeIndexBuffer.buffer,
-                  sharedContext.candidateCellCubeIndexBuffer.buffer, 1,
-                  &compactCopies[1]);
-  vkCmdCopyBuffer(commandBuffer, sharedContext.deviceSurfaceCellStatsBuffer.buffer,
+                  sharedContext.deviceSurfaceCellStatsBuffer.buffer,
                   sharedContext.surfaceCellStatsBuffer.buffer, 1,
-                  &compactCopies[2]);
+                  &compactCopies[0]);
 
   VkMemoryBarrier hostReadBarrier{};
   hostReadBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -6602,6 +6894,71 @@ bool run_frost_vulkan_classify_surface_cells_from_active_voxels(
         "Vulkan surface-cell compaction produced an invalid active-cell count.";
     cleanup();
     return false;
+  }
+
+  if (activeCellCount > 0u) {
+    const VkDeviceSize hostCompactBufferSize =
+        static_cast<VkDeviceSize>(activeCellCount) * sizeof(uint32_t);
+    if (!ensure_shared_host_buffer(
+            sharedContext, sharedContext.candidateCellIndexBuffer,
+            hostCompactBufferSize, "sparse compact surface cell-index buffer",
+            outError) ||
+        !ensure_shared_host_buffer(
+            sharedContext, sharedContext.candidateCellCubeIndexBuffer,
+            hostCompactBufferSize, "sparse compact surface cube-index buffer",
+            outError)) {
+      cleanup();
+      return false;
+    }
+
+    if (vkResetCommandPool(device, commandPool, 0) != VK_SUCCESS) {
+      outError =
+          "Failed to reset Vulkan sparse surface-cell command pool for compact readback.";
+      cleanup();
+      return false;
+    }
+
+    if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
+      outError =
+          "Failed to begin Vulkan sparse surface-cell compact readback command buffer.";
+      cleanup();
+      return false;
+    }
+
+    VkBufferCopy readbackCopies[2]{};
+    readbackCopies[0].size = hostCompactBufferSize;
+    readbackCopies[1].size = hostCompactBufferSize;
+    vkCmdCopyBuffer(commandBuffer,
+                    sharedContext.deviceCandidateCellIndexBuffer.buffer,
+                    sharedContext.candidateCellIndexBuffer.buffer, 1,
+                    &readbackCopies[0]);
+    vkCmdCopyBuffer(commandBuffer,
+                    sharedContext.deviceCandidateCellCubeIndexBuffer.buffer,
+                    sharedContext.candidateCellCubeIndexBuffer.buffer, 1,
+                    &readbackCopies[1]);
+
+    VkMemoryBarrier compactHostReadBarrier{};
+    compactHostReadBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    compactHostReadBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    compactHostReadBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
+                         &compactHostReadBarrier, 0, nullptr, 0, nullptr);
+
+    if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
+      outError =
+          "Failed to end Vulkan sparse surface-cell compact readback command buffer.";
+      cleanup();
+      return false;
+    }
+
+    if (vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS ||
+        vkQueueWaitIdle(queue) != VK_SUCCESS) {
+      outError =
+          "Failed to submit Vulkan sparse surface-cell compact readback.";
+      cleanup();
+      return false;
+    }
   }
 
   outActiveCellIndices.resize(activeCellCount, 0u);
@@ -7017,6 +7374,7 @@ bool run_frost_vulkan_generate_sparse_surface_mesh_from_active_voxels(
   surfacePushConstants.cellDimY = cellDimY;
   surfacePushConstants.domainDimX = dimX;
   surfacePushConstants.domainDimY = dimY;
+  surfacePushConstants.domainDimZ = dimZ;
   surfacePushConstants.domainMinX = computeResult.domainMinVoxel[0];
   surfacePushConstants.domainMinY = computeResult.domainMinVoxel[1];
   surfacePushConstants.domainMinZ = computeResult.domainMinVoxel[2];
@@ -7327,6 +7685,7 @@ bool run_frost_vulkan_generate_surface_mesh(
   pushConstants.cellDimY = dimY - 1;
   pushConstants.domainDimX = dimX;
   pushConstants.domainDimY = dimY;
+  pushConstants.domainDimZ = dimZ;
   pushConstants.domainMinX = computeResult.domainMinVoxel[0];
   pushConstants.domainMinY = computeResult.domainMinVoxel[1];
   pushConstants.domainMinZ = computeResult.domainMinVoxel[2];
@@ -7586,6 +7945,7 @@ bool run_frost_vulkan_generate_surface_mesh_from_resident_cells(
   pushConstants.cellDimY = dimY - 1;
   pushConstants.domainDimX = dimX;
   pushConstants.domainDimY = dimY;
+  pushConstants.domainDimZ = dimZ;
   pushConstants.domainMinX = computeResult.domainMinVoxel[0];
   pushConstants.domainMinY = computeResult.domainMinVoxel[1];
   pushConstants.domainMinZ = computeResult.domainMinVoxel[2];
@@ -7682,10 +8042,32 @@ bool run_frost_vulkan_generate_surface_mesh_from_resident_cells(
 
     const VkDeviceSize compactTriangleVertexBufferSize = static_cast<VkDeviceSize>(
         totalTriangleCount) * 9ull * sizeof(float);
+    const VkDeviceSize compactTriangleEdgeIdBufferSize =
+        static_cast<VkDeviceSize>(totalTriangleCount) * 3ull *
+        sizeof(uint32_t);
     if (!ensure_shared_host_buffer(
             sharedContext, sharedContext.surfaceTriangleVertexBuffer,
             compactTriangleVertexBufferSize,
             "resident compact surface triangle-vertex buffer", outError)) {
+      cleanup();
+      return false;
+    }
+    if (!ensure_shared_host_buffer(
+            sharedContext, sharedContext.surfaceTriangleEdgeIdBuffer,
+            compactTriangleEdgeIdBufferSize,
+            "resident compact surface triangle-edge-id buffer", outError)) {
+      cleanup();
+      return false;
+    }
+    if (sharedContext.deviceCandidateCellIndexBuffer.buffer == VK_NULL_HANDLE ||
+        sharedContext.deviceCandidateCellCubeIndexBuffer.buffer ==
+            VK_NULL_HANDLE ||
+        sharedContext.deviceCandidateCellIndexBuffer.capacity <
+            activeCellIndexBufferSize ||
+        sharedContext.deviceCandidateCellCubeIndexBuffer.capacity <
+            activeCellCubeIndexBufferSize) {
+      outError =
+          "Vulkan resident compact surface generation requires resident active-cell buffers.";
       cleanup();
       return false;
     }
@@ -7695,6 +8077,8 @@ bool run_frost_vulkan_generate_surface_mesh_from_resident_cells(
                 static_cast<size_t>(triangleCountBufferSize));
     std::memset(sharedContext.surfaceTriangleVertexBuffer.mapped, 0,
                 static_cast<size_t>(compactTriangleVertexBufferSize));
+    std::memset(sharedContext.surfaceTriangleEdgeIdBuffer.mapped, 0,
+                static_cast<size_t>(compactTriangleEdgeIdBufferSize));
 
     if (sharedContext.surfaceTriangleCompactDescriptorSetLayout ==
             VK_NULL_HANDLE ||
@@ -7707,24 +8091,30 @@ bool run_frost_vulkan_generate_surface_mesh_from_resident_cells(
       return false;
     }
 
-    VkDescriptorBufferInfo compactBufferInfos[4]{};
+    VkDescriptorBufferInfo compactBufferInfos[6]{};
     compactBufferInfos[0].buffer =
-        sharedContext.deviceSurfaceTriangleCountBuffer.buffer;
+        sharedContext.deviceCandidateCellIndexBuffer.buffer;
     compactBufferInfos[0].offset = 0;
-    compactBufferInfos[0].range = triangleCountBufferSize;
-    compactBufferInfos[1].buffer = sharedContext.candidateCellIndexBuffer.buffer;
+    compactBufferInfos[0].range = activeCellIndexBufferSize;
+    compactBufferInfos[1].buffer =
+        sharedContext.deviceCandidateCellCubeIndexBuffer.buffer;
     compactBufferInfos[1].offset = 0;
-    compactBufferInfos[1].range = triangleCountBufferSize;
-    compactBufferInfos[2].buffer =
-        sharedContext.deviceSurfaceTriangleVertexBuffer.buffer;
+    compactBufferInfos[1].range = activeCellCubeIndexBufferSize;
+    compactBufferInfos[2].buffer = sharedContext.voxelScalarFieldBuffer.buffer;
     compactBufferInfos[2].offset = 0;
-    compactBufferInfos[2].range = triangleVertexBufferSize;
-    compactBufferInfos[3].buffer = sharedContext.surfaceTriangleVertexBuffer.buffer;
+    compactBufferInfos[2].range = scalarFieldBufferSize;
+    compactBufferInfos[3].buffer = sharedContext.candidateCellIndexBuffer.buffer;
     compactBufferInfos[3].offset = 0;
-    compactBufferInfos[3].range = compactTriangleVertexBufferSize;
+    compactBufferInfos[3].range = triangleCountBufferSize;
+    compactBufferInfos[4].buffer = sharedContext.surfaceTriangleVertexBuffer.buffer;
+    compactBufferInfos[4].offset = 0;
+    compactBufferInfos[4].range = compactTriangleVertexBufferSize;
+    compactBufferInfos[5].buffer = sharedContext.surfaceTriangleEdgeIdBuffer.buffer;
+    compactBufferInfos[5].offset = 0;
+    compactBufferInfos[5].range = compactTriangleEdgeIdBufferSize;
 
-    VkWriteDescriptorSet compactWrites[4]{};
-    for (uint32_t i = 0; i < 4; ++i) {
+    VkWriteDescriptorSet compactWrites[6]{};
+    for (uint32_t i = 0; i < 6; ++i) {
       compactWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
       compactWrites[i].dstSet = sharedContext.surfaceTriangleCompactDescriptorSet;
       compactWrites[i].dstBinding = i;
@@ -7732,7 +8122,7 @@ bool run_frost_vulkan_generate_surface_mesh_from_resident_cells(
       compactWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       compactWrites[i].pBufferInfo = &compactBufferInfos[i];
     }
-    vkUpdateDescriptorSets(device, 4, compactWrites, 0, nullptr);
+    vkUpdateDescriptorSets(device, 6, compactWrites, 0, nullptr);
 
     VkCommandBuffer compactCommandBuffer =
         sharedContext.surfaceTriangleCompactCommandBuffer;
@@ -7869,6 +8259,9 @@ bool run_frost_vulkan_generate_compact_surface_vertices_from_resident_cells(
       static_cast<VkDeviceSize>(activeCellCount * sizeof(uint32_t));
   const VkDeviceSize compactTriangleVertexBufferSize = static_cast<VkDeviceSize>(
       totalTriangleCount) * 9ull * sizeof(float);
+  const VkDeviceSize compactTriangleEdgeIdBufferSize =
+      static_cast<VkDeviceSize>(totalTriangleCount) * 3ull *
+      sizeof(uint32_t);
 
   if (sharedContext.deviceCandidateCellIndexBuffer.buffer == VK_NULL_HANDLE ||
       sharedContext.deviceCandidateCellCubeIndexBuffer.buffer ==
@@ -7898,6 +8291,12 @@ bool run_frost_vulkan_generate_compact_surface_vertices_from_resident_cells(
         compactTriangleVertexBufferSize,
         "compact resident surface triangle-vertex buffer", outError);
   }
+  if (buffersReady) {
+    buffersReady = ensure_shared_host_buffer(
+        sharedContext, sharedContext.surfaceTriangleEdgeIdBuffer,
+        compactTriangleEdgeIdBufferSize,
+        "compact resident surface triangle-edge-id buffer", outError);
+  }
   if (!buffersReady) {
     cleanup();
     return false;
@@ -7920,8 +8319,10 @@ bool run_frost_vulkan_generate_compact_surface_vertices_from_resident_cells(
               static_cast<size_t>(triangleOffsetBufferSize));
   std::memset(sharedContext.surfaceTriangleVertexBuffer.mapped, 0,
               static_cast<size_t>(compactTriangleVertexBufferSize));
+  std::memset(sharedContext.surfaceTriangleEdgeIdBuffer.mapped, 0,
+              static_cast<size_t>(compactTriangleEdgeIdBufferSize));
 
-  VkDescriptorBufferInfo bufferInfos[5]{};
+  VkDescriptorBufferInfo bufferInfos[6]{};
   bufferInfos[0].buffer = sharedContext.deviceCandidateCellIndexBuffer.buffer;
   bufferInfos[0].offset = 0;
   bufferInfos[0].range = activeCellBufferSize;
@@ -7938,9 +8339,12 @@ bool run_frost_vulkan_generate_compact_surface_vertices_from_resident_cells(
   bufferInfos[4].buffer = sharedContext.surfaceTriangleVertexBuffer.buffer;
   bufferInfos[4].offset = 0;
   bufferInfos[4].range = compactTriangleVertexBufferSize;
+  bufferInfos[5].buffer = sharedContext.surfaceTriangleEdgeIdBuffer.buffer;
+  bufferInfos[5].offset = 0;
+  bufferInfos[5].range = compactTriangleEdgeIdBufferSize;
 
-  VkWriteDescriptorSet writes[5]{};
-  for (uint32_t i = 0; i < 5; ++i) {
+  VkWriteDescriptorSet writes[6]{};
+  for (uint32_t i = 0; i < 6; ++i) {
     writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[i].dstSet = sharedContext.surfaceTriangleCompactDescriptorSet;
     writes[i].dstBinding = i;
@@ -7948,7 +8352,7 @@ bool run_frost_vulkan_generate_compact_surface_vertices_from_resident_cells(
     writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[i].pBufferInfo = &bufferInfos[i];
   }
-  vkUpdateDescriptorSets(device, 5, writes, 0, nullptr);
+  vkUpdateDescriptorSets(device, 6, writes, 0, nullptr);
 
   VkCommandBuffer commandBuffer =
       sharedContext.surfaceTriangleCompactCommandBuffer;
@@ -7974,6 +8378,7 @@ bool run_frost_vulkan_generate_compact_surface_vertices_from_resident_cells(
   pushConstants.cellDimY = dimY - 1;
   pushConstants.domainDimX = dimX;
   pushConstants.domainDimY = dimY;
+  pushConstants.domainDimZ = dimZ;
   pushConstants.domainMinX = computeResult.domainMinVoxel[0];
   pushConstants.domainMinY = computeResult.domainMinVoxel[1];
   pushConstants.domainMinZ = computeResult.domainMinVoxel[2];
@@ -8045,6 +8450,16 @@ bool get_frost_vulkan_resident_surface_mesh_view(
       sharedContext.surfaceTriangleCountBuffer.mapped);
   outView.triangleVertices = reinterpret_cast<const float *>(
       sharedContext.surfaceTriangleVertexBuffer.mapped);
+  if (sharedContext.residentSurfaceTriangleVerticesCompacted &&
+      sharedContext.candidateCellIndexBuffer.mapped != nullptr) {
+    outView.triangleOffsets = reinterpret_cast<const uint32_t *>(
+        sharedContext.candidateCellIndexBuffer.mapped);
+  }
+  if (sharedContext.residentSurfaceTriangleVerticesCompacted &&
+      sharedContext.surfaceTriangleEdgeIdBuffer.mapped != nullptr) {
+    outView.triangleEdgeIds = reinterpret_cast<const uint32_t *>(
+        sharedContext.surfaceTriangleEdgeIdBuffer.mapped);
+  }
   outView.activeCellCount = activeCellCount;
   outView.triangleVerticesCompacted =
       sharedContext.residentSurfaceTriangleVerticesCompacted;
@@ -8139,6 +8554,7 @@ bool run_frost_vulkan_generate_deduplicated_surface_mesh(
   auto vkQueueWaitIdle = sharedContext.vkQueueWaitIdle;
   auto vkResetCommandPool = sharedContext.vkResetCommandPool;
   auto vkCmdFillBuffer = sharedContext.vkCmdFillBuffer;
+  auto vkCmdCopyBuffer = sharedContext.vkCmdCopyBuffer;
 
   auto cleanup = [&]() {
     if (device != VK_NULL_HANDLE) {
@@ -8169,18 +8585,63 @@ bool run_frost_vulkan_generate_deduplicated_surface_mesh(
     return false;
   }
 
-  bool buffersReady = ensure_shared_host_buffer(
-      sharedContext, sharedContext.surfaceMeshVertexBuffer, vertexMemorySize,
-      "surface mesh vertex buffer", outError);
+  if (sharedContext.surfaceTriangleEdgeIdBuffer.mapped == nullptr) {
+    outError =
+        "Vulkan GPU edge deduplication requires mapped resident edge-id data.";
+    cleanup();
+    return false;
+  }
+
+  {
+    const uint32_t *triangleEdgeIds = reinterpret_cast<const uint32_t *>(
+        sharedContext.surfaceTriangleEdgeIdBuffer.mapped);
+    const std::size_t edgeIdCount =
+        static_cast<std::size_t>(totalTriangleCount) * 3u;
+    uint32_t maxEdgeId = 0u;
+    for (std::size_t i = 0; i < edgeIdCount; ++i) {
+      const uint32_t edgeId = triangleEdgeIds[i];
+      maxEdgeId = std::max(maxEdgeId, edgeId);
+      if (edgeId >= totalEdgeCount) {
+        std::ostringstream stream;
+        stream << "Vulkan compact surface edge-id buffer contains an out-of-range "
+                  "value ("
+               << edgeId << " >= " << totalEdgeCount << ") at index " << i
+               << ".";
+        outError = stream.str();
+        cleanup();
+        return false;
+      }
+    }
+  }
+
+  bool buffersReady = ensure_shared_device_buffer(
+      sharedContext, sharedContext.deviceSurfaceMeshVertexBuffer,
+      vertexMemorySize, "device surface mesh vertex buffer", outError);
   if (buffersReady) {
-    buffersReady = ensure_shared_host_buffer(
-        sharedContext, sharedContext.denseEdgeToVertexIndexBuffer,
-        edgeMappingMemorySize, "dense edge-to-vertex index buffer", outError);
+    buffersReady = ensure_shared_device_buffer(
+        sharedContext, sharedContext.deviceDenseEdgeToVertexIndexBuffer,
+        edgeMappingMemorySize, "device dense edge-to-vertex index buffer",
+        outError);
+  }
+  if (buffersReady) {
+    buffersReady = ensure_shared_device_buffer(
+        sharedContext, sharedContext.deviceGlobalVertexCountBuffer,
+        globalCounterSize, "device global vertex count buffer", outError);
+  }
+  if (buffersReady) {
+    buffersReady = ensure_shared_device_buffer(
+        sharedContext, sharedContext.deviceSurfaceMeshIndexBuffer,
+        indexMemorySize, "device surface mesh index buffer", outError);
   }
   if (buffersReady) {
     buffersReady = ensure_shared_host_buffer(
         sharedContext, sharedContext.globalVertexCountBuffer, globalCounterSize,
         "global vertex count buffer", outError);
+  }
+  if (buffersReady) {
+    buffersReady = ensure_shared_host_buffer(
+        sharedContext, sharedContext.surfaceMeshVertexBuffer, vertexMemorySize,
+        "surface mesh vertex buffer", outError);
   }
   if (buffersReady) {
     buffersReady = ensure_shared_host_buffer(
@@ -8212,9 +8673,7 @@ bool run_frost_vulkan_generate_deduplicated_surface_mesh(
     return false;
   }
 
-  // Clear tracking map and counter
-  std::memset(sharedContext.denseEdgeToVertexIndexBuffer.mapped, 0xFF,
-              static_cast<size_t>(edgeMappingMemorySize));
+  // Clear staging outputs before the GPU fills device-local buffers.
   std::memset(sharedContext.globalVertexCountBuffer.mapped, 0,
               static_cast<size_t>(globalCounterSize));
 
@@ -8226,13 +8685,14 @@ bool run_frost_vulkan_generate_deduplicated_surface_mesh(
   vertexPassInfos[1].buffer = sharedContext.surfaceTriangleVertexBuffer.buffer;
   vertexPassInfos[1].offset = 0;
   vertexPassInfos[1].range = VK_WHOLE_SIZE;
-  vertexPassInfos[2].buffer = sharedContext.surfaceMeshVertexBuffer.buffer;
+  vertexPassInfos[2].buffer = sharedContext.deviceSurfaceMeshVertexBuffer.buffer;
   vertexPassInfos[2].offset = 0;
   vertexPassInfos[2].range = vertexMemorySize;
-  vertexPassInfos[3].buffer = sharedContext.denseEdgeToVertexIndexBuffer.buffer;
+  vertexPassInfos[3].buffer =
+      sharedContext.deviceDenseEdgeToVertexIndexBuffer.buffer;
   vertexPassInfos[3].offset = 0;
   vertexPassInfos[3].range = edgeMappingMemorySize;
-  vertexPassInfos[4].buffer = sharedContext.globalVertexCountBuffer.buffer;
+  vertexPassInfos[4].buffer = sharedContext.deviceGlobalVertexCountBuffer.buffer;
   vertexPassInfos[4].offset = 0;
   vertexPassInfos[4].range = globalCounterSize;
 
@@ -8252,10 +8712,11 @@ bool run_frost_vulkan_generate_deduplicated_surface_mesh(
   indexPassInfos[0].buffer = sharedContext.surfaceTriangleEdgeIdBuffer.buffer;
   indexPassInfos[0].offset = 0;
   indexPassInfos[0].range = VK_WHOLE_SIZE;
-  indexPassInfos[1].buffer = sharedContext.denseEdgeToVertexIndexBuffer.buffer;
+  indexPassInfos[1].buffer =
+      sharedContext.deviceDenseEdgeToVertexIndexBuffer.buffer;
   indexPassInfos[1].offset = 0;
   indexPassInfos[1].range = edgeMappingMemorySize;
-  indexPassInfos[2].buffer = sharedContext.surfaceMeshIndexBuffer.buffer;
+  indexPassInfos[2].buffer = sharedContext.deviceSurfaceMeshIndexBuffer.buffer;
   indexPassInfos[2].offset = 0;
   indexPassInfos[2].range = indexMemorySize;
 
@@ -8282,6 +8743,21 @@ bool run_frost_vulkan_generate_deduplicated_surface_mesh(
   EdgeDedupPushConstants pushConstants{};
   pushConstants.triangleCount = totalTriangleCount;
 
+  // Initialize device-local tracking buffers on the GPU.
+  vkCmdFillBuffer(vertexCmd, sharedContext.deviceDenseEdgeToVertexIndexBuffer.buffer,
+                  0, edgeMappingMemorySize, 0xFFFFFFFFu);
+  vkCmdFillBuffer(vertexCmd, sharedContext.deviceGlobalVertexCountBuffer.buffer, 0,
+                  globalCounterSize, 0u);
+
+  VkMemoryBarrier transferToComputeBarrier{};
+  transferToComputeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  transferToComputeBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  transferToComputeBarrier.dstAccessMask =
+      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  vkCmdPipelineBarrier(vertexCmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                       &transferToComputeBarrier, 0, nullptr, 0, nullptr);
+
   // ==== PASS 1: Vertex Extract ====
   vkCmdBindPipeline(vertexCmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                     sharedContext.edgeDedupVertexPipeline);
@@ -8294,7 +8770,7 @@ bool run_frost_vulkan_generate_deduplicated_surface_mesh(
                      sizeof(EdgeDedupPushConstants), &pushConstants);
 
   const uint32_t edgeWorkgroupCount =
-      static_cast<uint32_t>((totalTriangleCount * 3u + 63u) / 64u);
+      static_cast<uint32_t>((totalTriangleCount + 63u) / 64u);
   vkCmdDispatch(vertexCmd, edgeWorkgroupCount, 1, 1);
 
   // ==== BARRIER ====
@@ -8321,12 +8797,35 @@ bool run_frost_vulkan_generate_deduplicated_surface_mesh(
       static_cast<uint32_t>((totalTriangleCount + 63u) / 64u);
   vkCmdDispatch(vertexCmd, indexWorkgroupCount, 1, 1);
 
-  // ==== BARRIER FOR CPU TRANSFER ====
+  // ==== BARRIER FOR STAGING COPY ====
+  VkMemoryBarrier gpuToTransferBarrier{};
+  gpuToTransferBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  gpuToTransferBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  gpuToTransferBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  vkCmdPipelineBarrier(vertexCmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
+                       &gpuToTransferBarrier, 0,
+                       nullptr, 0, nullptr);
+
+  VkBufferCopy readbackCopies[3]{};
+  readbackCopies[0].size = globalCounterSize;
+  readbackCopies[1].size = vertexMemorySize;
+  readbackCopies[2].size = indexMemorySize;
+  vkCmdCopyBuffer(vertexCmd, sharedContext.deviceGlobalVertexCountBuffer.buffer,
+                  sharedContext.globalVertexCountBuffer.buffer, 1,
+                  &readbackCopies[0]);
+  vkCmdCopyBuffer(vertexCmd, sharedContext.deviceSurfaceMeshVertexBuffer.buffer,
+                  sharedContext.surfaceMeshVertexBuffer.buffer, 1,
+                  &readbackCopies[1]);
+  vkCmdCopyBuffer(vertexCmd, sharedContext.deviceSurfaceMeshIndexBuffer.buffer,
+                  sharedContext.surfaceMeshIndexBuffer.buffer, 1,
+                  &readbackCopies[2]);
+
   VkMemoryBarrier hostBarrier{};
   hostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-  hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  hostBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-  vkCmdPipelineBarrier(vertexCmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+  vkCmdPipelineBarrier(vertexCmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                        VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hostBarrier, 0,
                        nullptr, 0, nullptr);
 
@@ -8341,9 +8840,15 @@ bool run_frost_vulkan_generate_deduplicated_surface_mesh(
   submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   submitInfo.commandBufferCount = 1;
   submitInfo.pCommandBuffers = &vertexCmd;
-  if (vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS ||
-      vkQueueWaitIdle(queue) != VK_SUCCESS) {
-    outError = "Failed to submit Vulkan edge deduplication pass.";
+  const VkResult submitResult =
+      vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+  const VkResult waitResult =
+      (submitResult == VK_SUCCESS) ? vkQueueWaitIdle(queue) : submitResult;
+  if (submitResult != VK_SUCCESS || waitResult != VK_SUCCESS) {
+    std::ostringstream stream;
+    stream << "Failed to submit Vulkan edge deduplication pass (submit="
+           << submitResult << ", wait=" << waitResult << ").";
+    outError = stream.str();
     cleanup();
     return false;
   }
@@ -8543,6 +9048,7 @@ bool run_frost_vulkan_generate_dense_surface_mesh(
   pushConstants.cellDimY = cellDimY;
   pushConstants.domainDimX = dimX;
   pushConstants.domainDimY = dimY;
+  pushConstants.domainDimZ = dimZ;
   pushConstants.domainMinX = computeResult.domainMinVoxel[0];
   pushConstants.domainMinY = computeResult.domainMinVoxel[1];
   pushConstants.domainMinZ = computeResult.domainMinVoxel[2];

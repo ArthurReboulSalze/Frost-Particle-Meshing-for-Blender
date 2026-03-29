@@ -241,13 +241,83 @@ constexpr int kMarchingCubeEdgeCorners[12][2] = {
 };
 
 constexpr uint64_t kMaxDenseVulkanSurfaceCells = 128ull;
-constexpr uint64_t kMaxGpuSparseCandidateScanCells = 1048576ull;
 constexpr uint64_t kMinGpuSparseCandidateVoxels = 8192ull;
+constexpr uint64_t kGpuSparseCandidateCellWorkingSetBytes =
+    sizeof(uint32_t) * 6ull;
+constexpr uint64_t kMaxGpuSparseCandidateWorkingSetBytes =
+    96ull * 1024ull * 1024ull;
 constexpr uint64_t kDirectSurfaceDenseRemapMaxEdges = 16777216ull;
 constexpr uint32_t kMaxResidentRawSurfaceCells = 100000u;
 constexpr uint32_t kMaxResidentRawSurfaceTriangles = 200000u;
 constexpr uint64_t kMaxResidentRawSurfaceWorkingSetBytes = 64ull * 1024ull *
                                                            1024ull;
+constexpr uint32_t kMaxCompactEdgeIdCpuPackTriangles = 16384u;
+constexpr uint32_t kMaxMetaballRawSurfaceCells = 32768u;
+constexpr uint32_t kMaxMetaballRawSurfaceTriangles = 65536u;
+
+bool should_use_dense_vulkan_surface_pack(uint64_t totalEdgeCount,
+                                          uint32_t totalTriangleCount,
+                                          std::size_t activeCellCount) {
+  if (totalEdgeCount == 0ull ||
+      totalEdgeCount > kDirectSurfaceDenseRemapMaxEdges ||
+      totalTriangleCount == 0u) {
+    return false;
+  }
+
+  const uint64_t maxReferencedEdges =
+      std::min<uint64_t>(static_cast<uint64_t>(totalTriangleCount) * 3ull,
+                         totalEdgeCount);
+  if (maxReferencedEdges == 0ull) {
+    return false;
+  }
+
+  // Dense remap wins when the edge domain is close to the actually referenced
+  // working set. On large sparse domains, the sparse/hash path is much cheaper.
+  if (totalEdgeCount > maxReferencedEdges * 3ull) {
+    return false;
+  }
+
+  // For large active-cell sets, keep the dense path only if the grid edge space
+  // stays reasonably tight relative to the emitted surface workload.
+  if (activeCellCount > 16384u && totalEdgeCount > maxReferencedEdges * 2ull) {
+    return false;
+  }
+
+  return true;
+}
+
+bool nearly_equal_vulkan_float(float lhs, float rhs) {
+  return std::fabs(lhs - rhs) <= 1e-6f;
+}
+
+bool matches_vulkan_compute_signature(
+    const VulkanParticleComputeSettings &settings,
+    const VulkanParticleComputeResult &computeResult) {
+  return settings.fieldMode == computeResult.scalarFieldMode &&
+         nearly_equal_vulkan_float(settings.planningRadiusScale,
+                                   computeResult.planningRadiusScale) &&
+         nearly_equal_vulkan_float(settings.voxelLength,
+                                   computeResult.voxelLength) &&
+         nearly_equal_vulkan_float(settings.fieldRadiusScale,
+                                   computeResult.fieldRadiusScale) &&
+         nearly_equal_vulkan_float(settings.fieldThreshold,
+                                   computeResult.fieldThreshold) &&
+         nearly_equal_vulkan_float(settings.surfaceIsoValue,
+                                   computeResult.surfaceIsoValue) &&
+         nearly_equal_vulkan_float(settings.anisotropyMaxScale,
+                                   computeResult.anisotropyMaxScale) &&
+         nearly_equal_vulkan_float(settings.kernelSupportRadius,
+                                   computeResult.kernelSupportRadius);
+}
+
+struct VulkanDirectComputeCache {
+  bool valid = false;
+  std::vector<float> inputParticleFloats;
+  std::vector<float> inputVelocityFloats;
+  VulkanParticleComputeResult computeResult;
+  std::vector<uint32_t> surfaceCellIndices;
+  std::vector<uint32_t> surfaceCellCubeIndices;
+};
 
 bool exceeds_resident_raw_surface_budget(int domainDimX, int domainDimY,
                                          int domainDimZ,
@@ -291,6 +361,22 @@ bool exceeds_resident_raw_surface_budget(int domainDimX, int domainDimY,
       dedupIndexBytes + edgeMappingBytes;
 
   return estimatedWorkingSetBytes > kMaxResidentRawSurfaceWorkingSetBytes;
+}
+
+bool can_use_sparse_gpu_candidate_surface_path(uint64_t denseCellCount) {
+  if (denseCellCount == 0u) {
+    return false;
+  }
+
+  if (denseCellCount >
+      std::numeric_limits<uint64_t>::max() /
+          kGpuSparseCandidateCellWorkingSetBytes) {
+    return false;
+  }
+
+  const uint64_t estimatedWorkingSetBytes =
+      denseCellCount * kGpuSparseCandidateCellWorkingSetBytes;
+  return estimatedWorkingSetBytes <= kMaxGpuSparseCandidateWorkingSetBytes;
 }
 
 bool validate_vulkan_surface_geometry(
@@ -346,7 +432,6 @@ bool validate_vulkan_surface_geometry(
     const float *v0 = vertices.data() + static_cast<std::size_t>(i0) * 3u;
     const float *v1 = vertices.data() + static_cast<std::size_t>(i1) * 3u;
     const float *v2 = vertices.data() + static_cast<std::size_t>(i2) * 3u;
-
     const auto measure_edge = [&](const float *a, const float *b) {
       const float dx = b[0] - a[0];
       const float dy = b[1] - a[1];
@@ -582,8 +667,8 @@ bool build_vulkan_direct_surface_buffers_impl(
     std::string &outError) {
   const uint64_t totalEdgeCount =
       compute_total_packed_grid_edge_count(domainDimX, domainDimY, domainDimZ);
-  const bool useDenseEdgeRemap =
-      totalEdgeCount > 0ull && totalEdgeCount <= kDirectSurfaceDenseRemapMaxEdges;
+  const bool useDenseEdgeRemap = should_use_dense_vulkan_surface_pack(
+      totalEdgeCount, totalTriangleCount, activeCellCount);
 
   std::unordered_map<uint64_t, int> sparseEdgeToVertex;
   if (!useDenseEdgeRemap) {
@@ -882,11 +967,338 @@ bool build_vulkan_direct_surface_buffers_from_compact_edge_ids(
         "Vulkan compact resident surface edge-id range is unsupported for direct packing.";
     return false;
   }
+  const std::size_t totalTriangleCount =
+      static_cast<std::size_t>(surfaceMeshView.totalTriangleCount);
+  const uint32_t *triangleEdgeIds = surfaceMeshView.triangleEdgeIds;
+  const float *triangleVertices = surfaceMeshView.triangleVertices;
+  if (triangleEdgeIds == nullptr || triangleVertices == nullptr) {
+    outError = "Vulkan compact resident surface edge-id inputs are unavailable.";
+    return false;
+  }
 
-  // Phase C: GPU Accelerated Edge Deduplication
-  return run_frost_vulkan_generate_deduplicated_surface_mesh(
-      surfaceMeshView.totalTriangleCount, static_cast<uint32_t>(totalEdgeCount),
-      outVertices, outFaces, outError);
+  const bool useDenseEdgeRemap = should_use_dense_vulkan_surface_pack(
+      totalEdgeCount, surfaceMeshView.totalTriangleCount,
+      surfaceMeshView.activeCellCount);
+
+  outFaces.assign(totalTriangleCount * 3u, -1);
+  if (useDenseEdgeRemap) {
+    auto &denseWorkspace = get_direct_surface_dense_workspace();
+    denseWorkspace.prepare(static_cast<std::size_t>(totalEdgeCount), 0u,
+                           surfaceMeshView.totalTriangleCount);
+    auto &denseEdgeToVertex = denseWorkspace.denseEdgeToVertex;
+    auto &usedEdgeVertices = denseWorkspace.usedEdgeVertices;
+
+    for (std::size_t triangleIndex = 0; triangleIndex < totalTriangleCount;
+         ++triangleIndex) {
+      const std::size_t edgeBase = triangleIndex * 3u;
+      const std::size_t vertexBase = triangleIndex * 9u;
+      for (std::size_t edgeSlot = 0; edgeSlot < 3u; ++edgeSlot) {
+        const uint32_t edgeId = triangleEdgeIds[edgeBase + edgeSlot];
+        if (edgeId >= totalEdgeCount) {
+          std::ostringstream stream;
+          stream << "Vulkan compact resident surface edge id " << edgeId
+                 << " exceeds the supported dense range " << totalEdgeCount
+                 << ".";
+          outError = stream.str();
+          return false;
+        }
+
+        const std::size_t denseEdgeIndex = static_cast<std::size_t>(edgeId);
+        if (denseWorkspace.mark_edge(denseEdgeIndex)) {
+          denseEdgeToVertex[denseEdgeIndex] =
+              static_cast<int>(usedEdgeVertices.size() / 3u);
+          const std::size_t sourceVertexBase = vertexBase + edgeSlot * 3u;
+          usedEdgeVertices.push_back(triangleVertices[sourceVertexBase + 0u]);
+          usedEdgeVertices.push_back(triangleVertices[sourceVertexBase + 1u]);
+          usedEdgeVertices.push_back(triangleVertices[sourceVertexBase + 2u]);
+        }
+
+        const int vertexIndex = denseEdgeToVertex[denseEdgeIndex];
+        if (vertexIndex < 0) {
+          outError =
+              "Vulkan compact resident surface produced an invalid dense edge remap.";
+          return false;
+        }
+        outFaces[edgeBase + edgeSlot] = vertexIndex;
+      }
+    }
+
+    outVertices = usedEdgeVertices;
+    return true;
+  }
+
+  std::unordered_map<uint64_t, int> sparseEdgeToVertex;
+  sparseEdgeToVertex.reserve(totalTriangleCount * 2u);
+  outVertices.reserve(totalTriangleCount * 9u);
+
+  for (std::size_t triangleIndex = 0; triangleIndex < totalTriangleCount;
+       ++triangleIndex) {
+    const std::size_t edgeBase = triangleIndex * 3u;
+    const std::size_t vertexBase = triangleIndex * 9u;
+    for (std::size_t edgeSlot = 0; edgeSlot < 3u; ++edgeSlot) {
+      const uint64_t edgeId = triangleEdgeIds[edgeBase + edgeSlot];
+      auto it = sparseEdgeToVertex.find(edgeId);
+      if (it == sparseEdgeToVertex.end()) {
+        const int vertexIndex = static_cast<int>(outVertices.size() / 3u);
+        sparseEdgeToVertex.emplace(edgeId, vertexIndex);
+        const std::size_t sourceVertexBase = vertexBase + edgeSlot * 3u;
+        outVertices.push_back(triangleVertices[sourceVertexBase + 0u]);
+        outVertices.push_back(triangleVertices[sourceVertexBase + 1u]);
+        outVertices.push_back(triangleVertices[sourceVertexBase + 2u]);
+        outFaces[edgeBase + edgeSlot] = vertexIndex;
+      } else {
+        outFaces[edgeBase + edgeSlot] = it->second;
+      }
+    }
+  }
+
+  outError.clear();
+  return true;
+}
+
+bool validate_vulkan_surface_geometry_light(
+    const std::vector<float> &vertices, const std::vector<int> &faces,
+    std::string &outError) {
+  outError.clear();
+
+  if (vertices.empty() || faces.empty()) {
+    outError = "Vulkan direct surface mesh is empty.";
+    return false;
+  }
+  if ((vertices.size() % 3u) != 0u || (faces.size() % 3u) != 0u) {
+    outError = "Vulkan direct surface mesh buffer sizes are invalid.";
+    return false;
+  }
+
+  const std::size_t vertexCount = vertices.size() / 3u;
+  const std::size_t faceCount = faces.size() / 3u;
+  if (vertexCount == 0u || faceCount == 0u) {
+    outError = "Vulkan direct surface mesh contains no geometry.";
+    return false;
+  }
+
+  for (std::size_t i = 0; i < vertices.size(); ++i) {
+    if (!std::isfinite(vertices[i])) {
+      outError = "Vulkan direct surface mesh contains non-finite vertex data.";
+      return false;
+    }
+  }
+  for (std::size_t faceIndex = 0; faceIndex < faceCount; ++faceIndex) {
+    const std::size_t base = faceIndex * 3u;
+    const int i0 = faces[base + 0u];
+    const int i1 = faces[base + 1u];
+    const int i2 = faces[base + 2u];
+    if (i0 < 0 || i1 < 0 || i2 < 0 ||
+        static_cast<std::size_t>(i0) >= vertexCount ||
+        static_cast<std::size_t>(i1) >= vertexCount ||
+        static_cast<std::size_t>(i2) >= vertexCount) {
+      outError = "Vulkan direct surface mesh contains out-of-range indices.";
+      return false;
+    }
+    if (i0 == i1 || i1 == i2 || i0 == i2) {
+      outError = "Vulkan direct surface mesh contains degenerate faces.";
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool validate_vulkan_surface_fragmentation_light(
+    const std::vector<float> &vertices, const std::vector<int> &faces,
+    VulkanScalarFieldMode fieldMode, std::string &outError) {
+  if (fieldMode != VulkanScalarFieldMode::metaball) {
+    outError.clear();
+    return true;
+  }
+  if (vertices.empty() || faces.empty() || (vertices.size() % 3u) != 0u ||
+      (faces.size() % 3u) != 0u) {
+    outError = "Vulkan direct surface mesh is empty.";
+    return false;
+  }
+
+  const std::size_t vertexCount = vertices.size() / 3u;
+  const std::size_t faceCount = faces.size() / 3u;
+  if (vertexCount < 512u || faceCount < 512u) {
+    outError.clear();
+    return true;
+  }
+
+  std::vector<std::vector<int>> adjacency(vertexCount);
+  adjacency.reserve(vertexCount);
+  for (std::size_t faceIndex = 0; faceIndex < faceCount; ++faceIndex) {
+    const std::size_t base = faceIndex * 3u;
+    const int i0 = faces[base + 0u];
+    const int i1 = faces[base + 1u];
+    const int i2 = faces[base + 2u];
+    if (i0 < 0 || i1 < 0 || i2 < 0 ||
+        static_cast<std::size_t>(i0) >= vertexCount ||
+        static_cast<std::size_t>(i1) >= vertexCount ||
+        static_cast<std::size_t>(i2) >= vertexCount) {
+      outError = "Vulkan direct surface mesh contains out-of-range indices.";
+      return false;
+    }
+    adjacency[static_cast<std::size_t>(i0)].push_back(i1);
+    adjacency[static_cast<std::size_t>(i0)].push_back(i2);
+    adjacency[static_cast<std::size_t>(i1)].push_back(i0);
+    adjacency[static_cast<std::size_t>(i1)].push_back(i2);
+    adjacency[static_cast<std::size_t>(i2)].push_back(i0);
+    adjacency[static_cast<std::size_t>(i2)].push_back(i1);
+  }
+
+  std::vector<uint8_t> visited(vertexCount, 0u);
+  std::vector<int> stack;
+  stack.reserve(256);
+  std::size_t componentCount = 0u;
+  std::size_t largestComponentVertexCount = 0u;
+  for (std::size_t vertexIndex = 0; vertexIndex < vertexCount; ++vertexIndex) {
+    if (visited[vertexIndex] != 0u || adjacency[vertexIndex].empty()) {
+      continue;
+    }
+    ++componentCount;
+    std::size_t componentVertexCount = 0u;
+    stack.clear();
+    stack.push_back(static_cast<int>(vertexIndex));
+    visited[vertexIndex] = 1u;
+    while (!stack.empty()) {
+      const int current = stack.back();
+      stack.pop_back();
+      ++componentVertexCount;
+      for (const int neighbor : adjacency[static_cast<std::size_t>(current)]) {
+        if (neighbor < 0 ||
+            static_cast<std::size_t>(neighbor) >= vertexCount) {
+          continue;
+        }
+        const std::size_t neighborIndex = static_cast<std::size_t>(neighbor);
+        if (visited[neighborIndex] != 0u) {
+          continue;
+        }
+        visited[neighborIndex] = 1u;
+        stack.push_back(neighbor);
+      }
+    }
+    largestComponentVertexCount =
+        std::max(largestComponentVertexCount, componentVertexCount);
+  }
+
+  if (componentCount > 32u &&
+      largestComponentVertexCount * 4u < vertexCount) {
+    std::ostringstream stream;
+    stream << "Vulkan direct surface mesh fragmented into " << componentCount
+           << " disconnected components.";
+    outError = stream.str();
+    return false;
+  }
+
+  outError.clear();
+  return true;
+}
+
+bool sanitize_vulkan_surface_geometry_buffers(std::vector<float> &vertices,
+                                              std::vector<int> &faces) {
+  if (vertices.empty() || faces.empty() || (vertices.size() % 3u) != 0u ||
+      (faces.size() % 3u) != 0u) {
+    return false;
+  }
+
+  const std::size_t vertexCount = vertices.size() / 3u;
+  const std::size_t faceCount = faces.size() / 3u;
+  std::vector<int> remap(vertexCount, -1);
+  std::vector<float> compactVertices;
+  std::vector<int> compactFaces;
+  compactVertices.reserve(vertices.size());
+  compactFaces.reserve(faces.size());
+  const auto is_degenerate_triangle = [&](const float *v0, const float *v1,
+                                          const float *v2) {
+    const float e01x = v1[0] - v0[0];
+    const float e01y = v1[1] - v0[1];
+    const float e01z = v1[2] - v0[2];
+    const float e02x = v2[0] - v0[0];
+    const float e02y = v2[1] - v0[1];
+    const float e02z = v2[2] - v0[2];
+    const float e12x = v2[0] - v1[0];
+    const float e12y = v2[1] - v1[1];
+    const float e12z = v2[2] - v1[2];
+    const float len01Sq = e01x * e01x + e01y * e01y + e01z * e01z;
+    const float len02Sq = e02x * e02x + e02y * e02y + e02z * e02z;
+    const float len12Sq = e12x * e12x + e12y * e12y + e12z * e12z;
+    const float maxEdgeSq = std::max(len01Sq, std::max(len02Sq, len12Sq));
+    if (maxEdgeSq <= 1.0e-12f) {
+      return true;
+    }
+    const float crossX = e01y * e02z - e01z * e02y;
+    const float crossY = e01z * e02x - e01x * e02z;
+    const float crossZ = e01x * e02y - e01y * e02x;
+    const float areaTwiceSq =
+        crossX * crossX + crossY * crossY + crossZ * crossZ;
+    return !std::isfinite(areaTwiceSq) || areaTwiceSq <= maxEdgeSq * 1.0e-10f;
+  };
+
+  for (std::size_t faceIndex = 0; faceIndex < faceCount; ++faceIndex) {
+    const std::size_t base = faceIndex * 3u;
+    const int originalIndices[3] = {faces[base + 0u], faces[base + 1u],
+                                    faces[base + 2u]};
+    bool faceValid = true;
+    for (int slot = 0; slot < 3; ++slot) {
+      const int index = originalIndices[slot];
+      if (index < 0 || static_cast<std::size_t>(index) >= vertexCount) {
+        faceValid = false;
+        break;
+      }
+      const std::size_t vertexBase = static_cast<std::size_t>(index) * 3u;
+      if (!std::isfinite(vertices[vertexBase + 0u]) ||
+          !std::isfinite(vertices[vertexBase + 1u]) ||
+          !std::isfinite(vertices[vertexBase + 2u])) {
+        faceValid = false;
+        break;
+      }
+    }
+    if (!faceValid) {
+      continue;
+    }
+    const float *v0 =
+        vertices.data() + static_cast<std::size_t>(originalIndices[0]) * 3u;
+    const float *v1 =
+        vertices.data() + static_cast<std::size_t>(originalIndices[1]) * 3u;
+    const float *v2 =
+        vertices.data() + static_cast<std::size_t>(originalIndices[2]) * 3u;
+    if (is_degenerate_triangle(v0, v1, v2)) {
+      continue;
+    }
+
+    int compactIndices[3];
+    for (int slot = 0; slot < 3; ++slot) {
+      const int index = originalIndices[slot];
+      int mappedIndex = remap[static_cast<std::size_t>(index)];
+      if (mappedIndex < 0) {
+        mappedIndex = static_cast<int>(compactVertices.size() / 3u);
+        remap[static_cast<std::size_t>(index)] = mappedIndex;
+        const std::size_t vertexBase = static_cast<std::size_t>(index) * 3u;
+        compactVertices.push_back(vertices[vertexBase + 0u]);
+        compactVertices.push_back(vertices[vertexBase + 1u]);
+        compactVertices.push_back(vertices[vertexBase + 2u]);
+      }
+      compactIndices[slot] = mappedIndex;
+    }
+
+    if (compactIndices[0] == compactIndices[1] ||
+        compactIndices[1] == compactIndices[2] ||
+        compactIndices[0] == compactIndices[2]) {
+      continue;
+    }
+
+    compactFaces.push_back(compactIndices[0]);
+    compactFaces.push_back(compactIndices[1]);
+    compactFaces.push_back(compactIndices[2]);
+  }
+
+  if (compactVertices.empty() || compactFaces.empty()) {
+    return false;
+  }
+
+  vertices.swap(compactVertices);
+  faces.swap(compactFaces);
+  return true;
 }
 
 std::size_t scalar_field_index(const VulkanParticleComputeResult &computeResult,
@@ -1836,6 +2248,33 @@ bool build_vulkan_direct_surface_buffers_from_resident_view(
   if (surfaceMeshView.triangleVerticesCompacted &&
       surfaceMeshView.triangleOffsets != nullptr &&
       surfaceMeshView.triangleEdgeIds != nullptr) {
+    const uint64_t totalPackedEdgeCount =
+        compute_total_packed_grid_edge_count(domainDimX, domainDimY, domainDimZ);
+    const bool gpuEdgeDedupWorthwhile =
+        totalTriangleCount > kMaxCompactEdgeIdCpuPackTriangles &&
+        totalPackedEdgeCount > 0 &&
+        totalPackedEdgeCount <=
+            static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) &&
+        should_use_dense_vulkan_surface_pack(totalPackedEdgeCount,
+                                             totalTriangleCount,
+                                             surfaceMeshView.activeCellCount);
+    if (gpuEdgeDedupWorthwhile) {
+        std::string gpuDedupError;
+        const bool builtOnGpu =
+            run_frost_vulkan_generate_deduplicated_surface_mesh(
+                totalTriangleCount,
+                static_cast<uint32_t>(totalPackedEdgeCount), outVertices,
+                outFaces, gpuDedupError);
+        if (builtOnGpu) {
+          if (!validate_vulkan_surface_geometry_light(outVertices, outFaces,
+                                                      outError)) {
+            return false;
+          }
+          return validate_vulkan_surface_fragmentation_light(
+              outVertices, outFaces, computeResult.scalarFieldMode, outError);
+        }
+    }
+
     VulkanResidentSurfaceMeshView compactView = surfaceMeshView;
     compactView.totalTriangleCount = totalTriangleCount;
     const bool built = build_vulkan_direct_surface_buffers_from_compact_edge_ids(
@@ -1844,9 +2283,12 @@ bool build_vulkan_direct_surface_buffers_from_resident_view(
     if (!built) {
       return false;
     }
-    return validate_vulkan_surface_geometry(outVertices, outFaces,
-                                            computeResult.scalarFieldMode,
-                                            outError);
+    if (!validate_vulkan_surface_geometry_light(outVertices, outFaces,
+                                                outError)) {
+      return false;
+    }
+    return validate_vulkan_surface_fragmentation_light(
+        outVertices, outFaces, computeResult.scalarFieldMode, outError);
   }
   const int cellDimX = computeResult.domainDimensions[0] - 1;
   const int cellDimY = computeResult.domainDimensions[1] - 1;
@@ -2919,6 +3361,7 @@ public:
                              std::string &outError) override {
     outVertices.clear();
     outFaces.clear();
+    clear_cached_direct_compute();
 
     try {
       if (particles.size() == 0) {
@@ -2986,9 +3429,11 @@ public:
                                         voxelLength, maximumParticleRadius);
       computeSettings.allowCpuCompactedPairs = true;
       computeSettings.preferGpuCompactedPairs = true;
-      computeSettings.readbackCoverageCounts = true;
+      computeSettings.retainParticleBounds = false;
+      computeSettings.readbackCoverageCounts = false;
       computeSettings.readbackScalarField = false;
       computeSettings.retainParticleData = false;
+      computeSettings.sortActiveVoxelIndices = false;
       using Clock = std::chrono::steady_clock;
       const auto directPathStart = Clock::now();
       auto phaseStart = directPathStart;
@@ -2998,6 +3443,18 @@ public:
       double packSeconds = 0.0;
 
       VulkanParticleComputeResult computeResult;
+      std::vector<uint32_t> gpuSurfaceCellIndices;
+      std::vector<uint32_t> gpuSurfaceCellCubeIndices;
+      VulkanSurfaceMeshResult gpuSurfaceMesh;
+      auto fail_raw_path = [&](const std::string &message) -> bool {
+        outVertices.clear();
+        outFaces.clear();
+        outError = message;
+        cache_direct_compute(inputParticleFloats, inputVelocityFloats,
+                             computeResult, &gpuSurfaceCellIndices,
+                             &gpuSurfaceCellCubeIndices);
+        return false;
+      };
       if (!run_frost_vulkan_compute_particles(
               inputParticleFloats.data(),
               inputVelocityFloats.empty() ? nullptr
@@ -3014,6 +3471,10 @@ public:
             static_cast<uint64_t>(computeResult.domainDimensions[0]) *
             static_cast<uint64_t>(computeResult.domainDimensions[1]) *
             static_cast<uint64_t>(computeResult.domainDimensions[2]);
+        std::cout << "[Vulkan] Scalar field mode selected for direct path: "
+                  << get_vulkan_scalar_field_mode_name(
+                         computeResult.scalarFieldMode)
+                  << "." << std::endl;
         if (computeResult.activeVoxelCount > 0) {
           std::cout << "[Vulkan] GPU active-voxel compaction prepared "
                     << computeResult.activeVoxelCount << " active voxels out of "
@@ -3027,13 +3488,8 @@ public:
 
       if (computeResult.voxelScalarField.empty() &&
           !computeResult.scalarFieldResidentOnGpu) {
-        outError = "Vulkan direct mesh path requires a scalar field.";
-        return false;
+        return fail_raw_path("Vulkan direct mesh path requires a scalar field.");
       }
-
-      std::vector<uint32_t> gpuSurfaceCellIndices;
-      std::vector<uint32_t> gpuSurfaceCellCubeIndices;
-      VulkanSurfaceMeshResult gpuSurfaceMesh;
 
       const int64_t denseCellDimX =
           static_cast<int64_t>(computeResult.domainDimensions[0]) - 1ll;
@@ -3065,8 +3521,11 @@ public:
 
       if (!usedDenseGpuSurfacePath) {
         std::string sparseGpuCandidateError;
+        const bool allowSparseGpuCandidatePath =
+            computeResult.scalarFieldMode != VulkanScalarFieldMode::metaball;
         if (denseCellCount > 0 &&
-            denseCellCount <= kMaxGpuSparseCandidateScanCells &&
+            allowSparseGpuCandidatePath &&
+            can_use_sparse_gpu_candidate_surface_path(denseCellCount) &&
             computeResult.activeVoxelIndices.size() >=
                 kMinGpuSparseCandidateVoxels &&
             run_frost_vulkan_classify_surface_cells_from_active_voxels(
@@ -3089,20 +3548,41 @@ public:
           if (computeResult.voxelScalarField.empty() &&
               !ensure_frost_vulkan_scalar_field_readback(computeResult,
                                                          outError)) {
-            return false;
+            return fail_raw_path(outError);
           }
           std::vector<uint32_t> candidateCellIndices;
           build_vulkan_candidate_cell_indices(
               computeResult, computeResult.surfaceIsoValue, candidateCellIndices);
           if (candidateCellIndices.empty()) {
-            outError = "Vulkan direct mesh path found no candidate cells.";
-            return false;
+            return fail_raw_path(
+                "Vulkan direct mesh path found no candidate cells.");
           }
 
           if (!run_frost_vulkan_classify_surface_cells(
                   computeResult, candidateCellIndices, gpuSurfaceCellIndices,
                   gpuSurfaceCellCubeIndices, outError)) {
-            return false;
+            return fail_raw_path(outError);
+          }
+          if (!gpuSurfaceCellIndices.empty() &&
+              gpuSurfaceCellIndices.size() >= 4096u) {
+            if (ensure_frost_vulkan_resident_surface_cells(
+                    gpuSurfaceCellIndices, gpuSurfaceCellCubeIndices,
+                    sparseGpuCandidateError)) {
+              usedSparseGpuCandidatePath = true;
+              if (options.showDebugLog) {
+                std::cout
+                    << "[Vulkan] Promoting classified surface cells to the "
+                       "compact resident direct surface path."
+                    << std::endl;
+              }
+            } else if (options.showDebugLog &&
+                       !sparseGpuCandidateError.empty()) {
+              std::cout
+                  << "[Vulkan] Failed to upload classified surface cells to "
+                     "the compact resident direct surface path; falling back "
+                     "to the safer GPU extraction: "
+                  << sparseGpuCandidateError << std::endl;
+            }
           }
         }
         const double sparseSurfacePhaseSeconds =
@@ -3110,13 +3590,30 @@ public:
         classifySeconds = sparseSurfacePhaseSeconds;
         phaseStart = Clock::now();
         if (gpuSurfaceCellIndices.empty()) {
-          outError = "Vulkan direct mesh path found no active surface cells.";
-          return false;
+          return fail_raw_path(
+              "Vulkan direct mesh path found no active surface cells.");
         }
 
         uint32_t classifiedTriangleCount = 0u;
         for (uint32_t cubeIndex : gpuSurfaceCellCubeIndices) {
           classifiedTriangleCount += count_marching_cubes_triangles(cubeIndex);
+        }
+
+        if (usedSparseGpuCandidatePath &&
+            computeResult.scalarFieldMode == VulkanScalarFieldMode::metaball &&
+            (static_cast<uint32_t>(gpuSurfaceCellIndices.size()) >
+                 kMaxMetaballRawSurfaceCells ||
+             classifiedTriangleCount > kMaxMetaballRawSurfaceTriangles)) {
+          usedSparseGpuCandidatePath = false;
+          if (options.showDebugLog) {
+            std::cout
+                << "[Vulkan] Skipping the compact resident direct surface path "
+                   "for this heavy Metaball frame and using the safer GPU "
+                   "surface extraction instead ("
+                << gpuSurfaceCellIndices.size()
+                << " active cells, " << classifiedTriangleCount
+                << " triangles)." << std::endl;
+          }
         }
 
         if (exceeds_resident_raw_surface_budget(
@@ -3135,7 +3632,7 @@ public:
           outError =
               "Vulkan raw direct surface path exceeds the current safe "
               "stability budget for this scene.";
-          return false;
+          return fail_raw_path(outError);
         }
 
         if (usedSparseGpuCandidatePath) {
@@ -3154,9 +3651,8 @@ public:
           }
 
           if (residentTotalTriangleCount == 0u) {
-            outError =
-                "Vulkan direct mesh path found no resident surface triangles.";
-            return false;
+            return fail_raw_path(
+                "Vulkan direct mesh path found no resident surface triangles.");
           }
 
           if (exceeds_resident_raw_surface_budget(
@@ -3176,7 +3672,7 @@ public:
             outError =
                 "Vulkan raw direct surface path exceeds the current safe "
                 "stability budget for this scene.";
-            return false;
+            return fail_raw_path(outError);
           }
 
           const auto compactSurfacePhaseStart = Clock::now();
@@ -3185,7 +3681,7 @@ public:
                   static_cast<uint32_t>(gpuSurfaceCellIndices.size()),
                   residentTriangleOffsets, residentTotalTriangleCount,
                   outError)) {
-            return false;
+            return fail_raw_path(outError);
           }
           emitSeconds = std::chrono::duration<double>(Clock::now() -
                                                       compactSurfacePhaseStart)
@@ -3196,12 +3692,20 @@ public:
           if (!get_frost_vulkan_resident_compact_surface_vertex_view(
                   residentTotalTriangleCount, residentCompactTriangleVertices,
                   outError)) {
-            return false;
+            return fail_raw_path(outError);
           }
+          std::string residentEdgeIdError;
           if (!get_frost_vulkan_resident_compact_surface_edge_id_view(
                   residentTotalTriangleCount, residentCompactTriangleEdgeIds,
-                  outError)) {
-            return false;
+                  residentEdgeIdError)) {
+            residentCompactTriangleEdgeIds = nullptr;
+            if (options.showDebugLog && !residentEdgeIdError.empty()) {
+              std::cout
+                  << "[Vulkan] Resident compact surface edge-id view unavailable; "
+                     "rebuilding direct surface connectivity from compact "
+                     "triangle vertices instead: "
+                  << residentEdgeIdError << std::endl;
+            }
           }
           VulkanResidentSurfaceMeshView residentSurfaceView;
           residentSurfaceView.triangleCounts = residentTriangleCounts.data();
@@ -3216,28 +3720,64 @@ public:
           if (!build_vulkan_direct_surface_buffers_from_resident_view(
                   computeResult, residentSurfaceView, gpuSurfaceCellIndices,
                   gpuSurfaceCellCubeIndices, outVertices, outFaces, outError)) {
-            return false;
+            return fail_raw_path(outError);
           }
           packSeconds = std::chrono::duration<double>(Clock::now() -
                                                       buildSurfacePhaseStart)
                             .count();
-        } else if (!run_frost_vulkan_generate_surface_mesh(
-                       computeResult, gpuSurfaceCellIndices,
-                       gpuSurfaceCellCubeIndices, gpuSurfaceMesh, outError)) {
-          return false;
-        }
-        emitSeconds =
-            std::chrono::duration<double>(Clock::now() - phaseStart).count();
-        phaseStart = Clock::now();
-        if (!usedSparseGpuCandidatePath &&
-            !build_vulkan_direct_surface_buffers(
-                computeResult, gpuSurfaceMesh, gpuSurfaceCellIndices,
-                gpuSurfaceCellCubeIndices, outVertices, outFaces, outError)) {
-          return false;
-        }
-        if (!usedSparseGpuCandidatePath) {
-          packSeconds =
-              std::chrono::duration<double>(Clock::now() - phaseStart).count();
+        } else {
+          bool usedResidentSurfacePath = false;
+          const auto residentSurfacePhaseStart = Clock::now();
+          if (run_frost_vulkan_generate_surface_mesh_from_resident_cells(
+                  computeResult,
+                  static_cast<uint32_t>(gpuSurfaceCellIndices.size()),
+                  gpuSurfaceMesh, outError, false)) {
+            emitSeconds =
+                std::chrono::duration<double>(Clock::now() -
+                                              residentSurfacePhaseStart)
+                    .count();
+            VulkanResidentSurfaceMeshView residentSurfaceView;
+            if (!get_frost_vulkan_resident_surface_mesh_view(
+                    static_cast<uint32_t>(gpuSurfaceCellIndices.size()),
+                    residentSurfaceView, outError)) {
+              return fail_raw_path(outError);
+            }
+            const auto buildSurfacePhaseStart = Clock::now();
+            if (!build_vulkan_direct_surface_buffers_from_resident_view(
+                    computeResult, residentSurfaceView, gpuSurfaceCellIndices,
+                    gpuSurfaceCellCubeIndices, outVertices, outFaces,
+                    outError)) {
+              return fail_raw_path(outError);
+            }
+            packSeconds =
+                std::chrono::duration<double>(Clock::now() -
+                                              buildSurfacePhaseStart)
+                    .count();
+            usedResidentSurfacePath = true;
+          }
+
+          if (!usedResidentSurfacePath) {
+            outError.clear();
+            phaseStart = Clock::now();
+            if (!run_frost_vulkan_generate_surface_mesh(
+                    computeResult, gpuSurfaceCellIndices,
+                    gpuSurfaceCellCubeIndices, gpuSurfaceMesh, outError)) {
+              return fail_raw_path(outError);
+            }
+            emitSeconds =
+                std::chrono::duration<double>(Clock::now() - phaseStart)
+                    .count();
+            phaseStart = Clock::now();
+            if (!build_vulkan_direct_surface_buffers(
+                    computeResult, gpuSurfaceMesh, gpuSurfaceCellIndices,
+                    gpuSurfaceCellCubeIndices, outVertices, outFaces,
+                    outError)) {
+              return fail_raw_path(outError);
+            }
+            packSeconds =
+                std::chrono::duration<double>(Clock::now() - phaseStart)
+                    .count();
+          }
         }
       } else {
         classifySeconds =
@@ -3249,7 +3789,7 @@ public:
           !build_vulkan_direct_surface_buffers(
               computeResult, gpuSurfaceMesh, gpuSurfaceCellIndices,
               gpuSurfaceCellCubeIndices, outVertices, outFaces, outError)) {
-        return false;
+        return fail_raw_path(outError);
       }
       if (usedDenseGpuSurfacePath) {
         packSeconds =
@@ -3369,17 +3909,29 @@ public:
 
       std::vector<PackedParticle> outputParticles;
       VulkanParticleComputeResult computeResult;
+      std::vector<uint32_t> cachedSurfaceCellIndices;
+      std::vector<uint32_t> cachedSurfaceCellCubeIndices;
       std::string computeError;
       bool usedComputeShader = false;
+      bool reusedCachedCompute = false;
       bool usedExperimentalFieldMesh = false;
-      if (run_frost_vulkan_compute_particles(inputParticleFloats.data(),
-                                             inputVelocityFloats.empty()
-                                                 ? nullptr
+      if (take_cached_direct_compute(inputParticleFloats, inputVelocityFloats,
+                                     computeSettings, computeResult,
+                                     cachedSurfaceCellIndices,
+                                     cachedSurfaceCellCubeIndices)) {
+        usedComputeShader = true;
+        reusedCachedCompute = true;
+        if (options.showDebugLog) {
+          std::cout << "[Vulkan] Reusing cached compute result from the raw GPU "
+                       "fallback path."
+                    << std::endl;
+        }
+      } else if (run_frost_vulkan_compute_particles(
+                     inputParticleFloats.data(),
+                     inputVelocityFloats.empty() ? nullptr
                                                  : inputVelocityFloats.data(),
-                                             inputParticles.size(),
-                                             computeSettings,
-                                             computeResult,
-                                             computeError)) {
+                     inputParticles.size(), computeSettings, computeResult,
+                     computeError)) {
         usedComputeShader = true;
         outputParticles.resize(inputParticles.size());
         for (size_t i = 0; i < outputParticles.size(); ++i) {
@@ -3487,31 +4039,63 @@ public:
         }
       }
 
+      if (outputParticles.empty() && reusedCachedCompute) {
+        outputParticles = inputParticles;
+      }
+
       if (outputParticles.size() != inputParticles.size()) {
         outError =
             "Vulkan backend returned a particle count mismatch after round-trip.";
         return false;
       }
 
-      if (usedComputeShader && !computeResult.voxelScalarField.empty()) {
+      if (usedComputeShader &&
+          (!computeResult.voxelScalarField.empty() ||
+           computeResult.scalarFieldResidentOnGpu)) {
         std::string fieldMeshError;
         frantic::geometry::trimesh3 fieldMesh;
-        std::vector<uint32_t> gpuSurfaceCellIndices;
-        std::vector<uint32_t> gpuSurfaceCellCubeIndices;
+        std::vector<uint32_t> gpuSurfaceCellIndices =
+            std::move(cachedSurfaceCellIndices);
+        std::vector<uint32_t> gpuSurfaceCellCubeIndices =
+            std::move(cachedSurfaceCellCubeIndices);
         std::vector<uint32_t> candidateCellIndices;
-        build_vulkan_candidate_cell_indices(
-            computeResult, computeResult.surfaceIsoValue, candidateCellIndices);
-        if (options.showDebugLog) {
-          std::cout << "[Vulkan] Prepared " << candidateCellIndices.size()
-                    << " candidate Marching Cubes cells for GPU classification."
+        std::string surfaceClassificationError;
+        bool classifiedSurfaceCells = !gpuSurfaceCellIndices.empty() &&
+                                      gpuSurfaceCellIndices.size() ==
+                                          gpuSurfaceCellCubeIndices.size();
+        if (!classifiedSurfaceCells) {
+          if (computeResult.voxelScalarField.empty() &&
+              !ensure_frost_vulkan_scalar_field_readback(computeResult,
+                                                         surfaceClassificationError)) {
+            if (options.showDebugLog && !surfaceClassificationError.empty()) {
+              std::cout << "[Vulkan] Scalar-field readback unavailable, "
+                           "falling back to CPU-side cell classification: "
+                        << surfaceClassificationError << std::endl;
+            }
+          } else {
+            build_vulkan_candidate_cell_indices(
+                computeResult, computeResult.surfaceIsoValue,
+                candidateCellIndices);
+            if (options.showDebugLog) {
+              std::cout << "[Vulkan] Prepared " << candidateCellIndices.size()
+                        << " candidate Marching Cubes cells for GPU "
+                           "classification."
+                        << std::endl;
+            }
+            classifiedSurfaceCells =
+                !candidateCellIndices.empty() &&
+                run_frost_vulkan_classify_surface_cells(
+                    computeResult, candidateCellIndices,
+                    gpuSurfaceCellIndices, gpuSurfaceCellCubeIndices,
+                    surfaceClassificationError);
+          }
+        } else if (options.showDebugLog) {
+          std::cout << "[Vulkan] Reusing "
+                    << gpuSurfaceCellIndices.size()
+                    << " cached GPU-classified surface cells from the raw "
+                       "fallback path."
                     << std::endl;
         }
-        std::string surfaceClassificationError;
-        const bool classifiedSurfaceCells =
-            !candidateCellIndices.empty() &&
-            run_frost_vulkan_classify_surface_cells(
-                computeResult, candidateCellIndices, gpuSurfaceCellIndices,
-                gpuSurfaceCellCubeIndices, surfaceClassificationError);
         if (classifiedSurfaceCells && options.showDebugLog) {
           std::size_t cubeMismatchCount = 0;
           const int cellDimX = computeResult.domainDimensions[0] - 1;
@@ -3687,6 +4271,62 @@ public:
       return false;
     }
   }
+
+private:
+  void clear_cached_direct_compute() {
+    m_cachedDirectCompute = VulkanDirectComputeCache{};
+  }
+
+  void cache_direct_compute(
+      const std::vector<float> &inputParticleFloats,
+      const std::vector<float> &inputVelocityFloats,
+      const VulkanParticleComputeResult &computeResult,
+      const std::vector<uint32_t> *surfaceCellIndices = nullptr,
+      const std::vector<uint32_t> *surfaceCellCubeIndices = nullptr) {
+    m_cachedDirectCompute.valid = true;
+    m_cachedDirectCompute.inputParticleFloats = inputParticleFloats;
+    m_cachedDirectCompute.inputVelocityFloats = inputVelocityFloats;
+    m_cachedDirectCompute.computeResult = computeResult;
+    if (surfaceCellIndices != nullptr) {
+      m_cachedDirectCompute.surfaceCellIndices = *surfaceCellIndices;
+    } else {
+      m_cachedDirectCompute.surfaceCellIndices.clear();
+    }
+    if (surfaceCellCubeIndices != nullptr) {
+      m_cachedDirectCompute.surfaceCellCubeIndices = *surfaceCellCubeIndices;
+    } else {
+      m_cachedDirectCompute.surfaceCellCubeIndices.clear();
+    }
+  }
+
+  bool take_cached_direct_compute(
+      const std::vector<float> &inputParticleFloats,
+      const std::vector<float> &inputVelocityFloats,
+      const VulkanParticleComputeSettings &computeSettings,
+      VulkanParticleComputeResult &outComputeResult,
+      std::vector<uint32_t> &outSurfaceCellIndices,
+      std::vector<uint32_t> &outSurfaceCellCubeIndices) {
+    if (!m_cachedDirectCompute.valid) {
+      return false;
+    }
+
+    if (m_cachedDirectCompute.inputParticleFloats != inputParticleFloats ||
+        m_cachedDirectCompute.inputVelocityFloats != inputVelocityFloats ||
+        !matches_vulkan_compute_signature(computeSettings,
+                                          m_cachedDirectCompute.computeResult)) {
+      clear_cached_direct_compute();
+      return false;
+    }
+
+    outComputeResult = std::move(m_cachedDirectCompute.computeResult);
+    outSurfaceCellIndices = std::move(m_cachedDirectCompute.surfaceCellIndices);
+    outSurfaceCellCubeIndices =
+        std::move(m_cachedDirectCompute.surfaceCellCubeIndices);
+    clear_cached_direct_compute();
+    return true;
+  }
+
+  VulkanDirectComputeCache m_cachedDirectCompute;
 };
 
 #endif

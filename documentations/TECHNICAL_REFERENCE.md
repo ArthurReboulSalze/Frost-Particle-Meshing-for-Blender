@@ -1,6 +1,6 @@
 # Frost for Blender - Technical Reference
 
-Scope: addon release `1.25.0`  
+Scope: addon release `1.26.0`  
 Supported Blender version: `5+`
 
 ---
@@ -41,6 +41,7 @@ Main native files:
 Responsibilities:
 
 - extract source particles from Blender
+- read evaluated meshes / point clouds from Blender when source data is animated or deformed
 - transform world-space source particles into the Frost object local space
 - map UI properties to native parameters
 - write the generated mesh back with `foreach_set`
@@ -110,7 +111,8 @@ Important nuance:
 Current testing trend:
 
 - CPU still usually wins on low-poly scenes
-- Vulkan can already win on heavier / high-poly scenes depending on the setup
+- Vulkan can now reach parity or win on heavier / high-poly scenes depending on the setup
+- dense animated scenes still expose the biggest remaining performance gap on the Vulkan path
 
 ---
 
@@ -121,9 +123,26 @@ The GPU path now uses several safety layers:
 - validation of raw GPU vertex/index buffers before they are returned to Blender
 - rejection of invalid or clearly pathological direct GPU surface geometry
 - fallback from unsafe direct Vulkan surface extraction to safer GPU-derived scalar-field extraction
+- reuse of the last raw-path compute result when the backend has to retry through the safer GPU surface path
 - final fallback to CPU meshing when GPU extraction is not safe enough
 
 This is why Blender stability improved even when aggressive GPU paths are being tested.
+
+--- 
+
+## Animated Source Support
+
+`MESH` and `POINT_CLOUD` extraction now read Blender's evaluated geometry instead of only the raw datablock.
+
+This is what makes the current addon correctly follow:
+
+- shape keys
+- armatures / bones
+- animated modifier stacks
+- Alembic geometry caches
+- animated point-cloud data
+
+The remaining performance concern is not feature correctness anymore, but the cost of rebuilding Frost on dense animated scenes.
 
 ---
 
@@ -141,16 +160,6 @@ Reason:
 - the current Vulkan path does not yet reproduce the CPU refinement stage safely enough for release use
 
 So this is a current capability gap, not a UI bug.
-
----
-
-## Mesh Source Limitation
-
-For `MESH` sources, the addon still reads `obj.data` directly.
-
-Implication:
-
-- non-applied mesh modifiers are not automatically evaluated as Frost source geometry
 
 ---
 
@@ -184,10 +193,9 @@ The current public distribution model is:
 
 - Vulkan is still being tuned for stability and performance.
 - `Vertex Refinement` still forces the final surface build back to CPU.
-- `MESH` sources still do not use evaluated modifier-stack geometry automatically.
 - The legacy CUDA code still exists in the source tree, but the public release direction is the single `CPU + Vulkan` addon package.
 
 ---
 
-Document version: `1.7`  
-Last update: `2026-03-27`
+Document version: `1.8`  
+Last update: `2026-03-29`

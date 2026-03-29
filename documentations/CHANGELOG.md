@@ -1,7 +1,31 @@
 # Frost for Blender - Changelog
 
-Current addon version: `1.25.0`  
-Last updated: `2026-03-27`
+Current addon version: `1.26.0`  
+Last updated: `2026-03-29`
+
+---
+
+## v1.26.0 - Evaluated Sources and Vulkan Fallback Reuse (2026-03-29)
+
+### Added / Improved
+
+- `MESH` and `POINT_CLOUD` sources now read Blender evaluated geometry, so Frost follows shape keys, armatures, animated modifiers, Alembic caches, and animated point data.
+- Reworked the Vulkan raw-to-safe fallback so the backend can reuse the already computed scalar field and classified surface cells instead of recomputing the whole frame.
+- Improved the direct Vulkan release candidate path on dense `Metaball` scenes by fixing resident surface compaction and by tightening the adaptive pack selection.
+- Refreshed the public documentation for the current `CPU + Vulkan` workflow and the latest measured performance trends.
+
+### Fixed
+
+- Fixed disappearing / collapsed GPU meshes on dense `Metaball` frames where vertices could end up compacted to invalid positions.
+- Fixed several Vulkan heavy-frame regressions where the pack path became pathologically slow on medium and dense resolutions.
+- Fixed animated source extraction so deformed Blender geometry is actually reflected in the generated Frost mesh.
+- Reduced duplicate Vulkan work when the raw GPU path is rejected and the backend has to continue through the safer GPU surface extraction path.
+
+### Notes
+
+- CPU remains the stable reference path.
+- Vulkan is still under active optimization, but the gap has tightened significantly on heavier scenes.
+- `Vertex Refinement` still forces the final surface build back to the CPU path for now.
 
 ---
 

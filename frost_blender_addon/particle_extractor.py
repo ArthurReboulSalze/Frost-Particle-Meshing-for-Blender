@@ -12,14 +12,32 @@ import numpy as np
 from typing import Tuple, Optional
 
 
+def _get_evaluated_object(obj: bpy.types.Object) -> bpy.types.Object:
+    """Return the depsgraph-evaluated Blender object."""
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    return obj.evaluated_get(depsgraph)
+
+
+def _transform_positions_to_world(positions: np.ndarray, matrix_world) -> np.ndarray:
+    """Transform an (N, 3) position array from local to world space."""
+    if len(positions) == 0:
+        return positions.astype(np.float32, copy=False)
+
+    matrix = np.array(matrix_world, dtype=np.float32)
+    rotation_scale = matrix[:3, :3]
+    translation = matrix[:3, 3]
+    world_positions = positions @ rotation_scale.T
+    world_positions += translation
+    return world_positions.astype(np.float32, copy=False)
+
+
 def extract_from_particle_system(obj: bpy.types.Object, 
                                  particle_system_index: int = 0) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """
     Extract particles from a Blender Particle System.
     """
     # Get evaluated object to ensure we get current particle state
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    eval_obj = obj.evaluated_get(depsgraph)
+    eval_obj = _get_evaluated_object(obj)
     
     if not eval_obj.particle_systems:
         return np.zeros((0, 3)), np.zeros(0), None
@@ -38,9 +56,6 @@ def extract_from_particle_system(obj: bpy.types.Object,
     positions = np.zeros((num_particles, 3), dtype=np.float32)
     radii = np.zeros(num_particles, dtype=np.float32)
     velocities = np.zeros((num_particles, 3), dtype=np.float32)
-    
-    # Pre-calculate matrix for world space conversion
-    matrix_world = eval_obj.matrix_world
     
     # Optimization: Use foreach_get for faster extraction if possible, 
     # but particle.location is a float vector, require flattening.
@@ -113,17 +128,18 @@ def extract_from_point_cloud(obj: bpy.types.Object) -> Tuple[np.ndarray, np.ndar
     """
     if obj.type != 'POINTCLOUD':
         return np.zeros((0, 3)), np.zeros(0), None
-    
-    point_cloud = obj.data
+
+    eval_obj = _get_evaluated_object(obj)
+    point_cloud = eval_obj.data
     num_points = len(point_cloud.points)
     
     if num_points == 0:
         return np.zeros((0, 3)), np.zeros(0), None
     
-    # Extract positions
-    positions = np.zeros((num_points, 3), dtype=np.float32)
-    for i, point in enumerate(point_cloud.points):
-        positions[i] = point.co
+    positions_flat = np.zeros(num_points * 3, dtype=np.float32)
+    point_cloud.points.foreach_get("co", positions_flat)
+    positions = positions_flat.reshape((num_points, 3))
+    positions = _transform_positions_to_world(positions, eval_obj.matrix_world)
     
     # Check for radius attribute
     radii = np.ones(num_points, dtype=np.float32) * 0.1  # Default radius
@@ -153,22 +169,27 @@ def extract_from_mesh_vertices(obj: bpy.types.Object,
     """
     if obj.type != 'MESH':
         return np.zeros((0, 3)), np.zeros(0), None
-    
-    mesh = obj.data
-    num_verts = len(mesh.vertices)
-    
-    if num_verts == 0:
+
+    eval_obj = _get_evaluated_object(obj)
+    eval_mesh = eval_obj.to_mesh()
+    if eval_mesh is None:
         return np.zeros((0, 3)), np.zeros(0), None
-    
-    # Extract vertex positions (in world space)
-    positions = np.zeros((num_verts, 3), dtype=np.float32)
-    for i, vert in enumerate(mesh.vertices):
-        world_pos = obj.matrix_world @ vert.co
-        positions[i] = world_pos
-    
-    radii = np.ones(num_verts, dtype=np.float32) * default_radius
-    
-    return positions, radii, None
+
+    try:
+        num_verts = len(eval_mesh.vertices)
+
+        if num_verts == 0:
+            return np.zeros((0, 3)), np.zeros(0), None
+
+        coords_flat = np.zeros(num_verts * 3, dtype=np.float32)
+        eval_mesh.vertices.foreach_get("co", coords_flat)
+        positions = coords_flat.reshape((num_verts, 3))
+        positions = _transform_positions_to_world(positions, eval_obj.matrix_world)
+
+        radii = np.full(num_verts, default_radius, dtype=np.float32)
+        return positions, radii, None
+    finally:
+        eval_obj.to_mesh_clear()
 
 
 def extract_particles(obj: bpy.types.Object, 

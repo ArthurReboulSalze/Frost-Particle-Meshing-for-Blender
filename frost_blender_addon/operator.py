@@ -37,6 +37,9 @@ except Exception as e:
 import gc
 
 _updates_in_progress = set()
+_pending_update_objects = {}
+_update_flush_registered = False
+_last_handler_update_state = {}
 
 
 def has_native_backend():
@@ -141,10 +144,97 @@ def record_meshing_status(frost_props, gpu_requested, meshing_info):
 
 def unload_adapter():
     """Explicitly release the C++ adapter to prevent shutdown crashes."""
-    global blender_frost_adapter, _frost_cache
+    global blender_frost_adapter, _frost_cache, _pending_update_objects, _update_flush_registered, _last_handler_update_state
     _frost_cache.clear()
+    _pending_update_objects.clear()
+    _update_flush_registered = False
+    _last_handler_update_state.clear()
     blender_frost_adapter = None
     gc.collect()
+
+
+def _get_frame_marker(obj=None):
+    context = getattr(bpy, "context", None)
+    scene = getattr(context, "scene", None)
+    if scene is None and obj is not None:
+        try:
+            scene = obj.id_data.users_scene[0]
+        except Exception:
+            scene = None
+
+    if scene is None:
+        return None
+
+    frame_current = getattr(scene, "frame_current", None)
+    frame_subframe = getattr(scene, "frame_subframe", 0.0)
+    return (frame_current, round(float(frame_subframe), 4))
+
+
+def _flush_pending_frost_updates():
+    """Coalesce handler-triggered updates so a frame only rebuilds once per UI tick."""
+    global _pending_update_objects, _update_flush_registered
+
+    pending_updates = list(_pending_update_objects.values())
+    _pending_update_objects.clear()
+    _update_flush_registered = False
+
+    context = getattr(bpy, "context", None)
+
+    for obj in pending_updates:
+        try:
+            if obj is None:
+                continue
+
+            existing_obj = bpy.data.objects.get(obj.name)
+            if existing_obj is None:
+                continue
+
+            props = getattr(existing_obj, "frost_properties", None)
+            if not props or not props.auto_update:
+                continue
+
+            update_frost_mesh(existing_obj, context)
+        except ReferenceError:
+            continue
+        except Exception as exc:
+            print(f"Frost Queued Update Error: {exc}")
+
+    return None
+
+
+def request_frost_update(obj, source="handler"):
+    """Queue a Frost update for the next UI tick instead of rebuilding immediately."""
+    global _pending_update_objects, _update_flush_registered, _last_handler_update_state
+
+    if blender_frost_adapter is None or obj is None or obj.type != 'MESH':
+        return
+
+    props = getattr(obj, "frost_properties", None)
+    if not props or not props.auto_update:
+        return
+
+    try:
+        key = int(obj.as_pointer())
+    except Exception:
+        key = id(obj)
+
+    if source != "property" and key in _updates_in_progress:
+        return
+
+    if source != "property":
+        frame_marker = _get_frame_marker(obj)
+        now = time.perf_counter()
+        recent_state = _last_handler_update_state.get(key)
+        if recent_state is not None:
+            recent_frame, recent_time = recent_state
+            if recent_frame == frame_marker and (now - recent_time) < 0.25:
+                return
+
+    _pending_update_objects[key] = obj
+
+    if not _update_flush_registered:
+        bpy.app.timers.register(_flush_pending_frost_updates, first_interval=0.0)
+        _update_flush_registered = True
 
 
 def validate_mesh_arrays(vertices, faces):
@@ -486,7 +576,9 @@ def update_frost_mesh(obj, context):
             
         except Exception as e:
             print(f"Failed to update Blender mesh data: {str(e)}")
-        
+
+        _last_handler_update_state[obj_id] = (_get_frame_marker(obj), time.perf_counter())
+
         elapsed = time.time() - start_time
         # print(f"Frost Update: {len(vertices)} verts in {elapsed:.3f}s")
     finally:

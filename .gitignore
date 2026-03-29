@@ -61,3 +61,5 @@ AGENT.md
 CLAUDE.md
 .agent-mem/
 test_frost.py
+tmp_*.py
+benchmark/
