@@ -1,0 +1,21 @@
+Frost Particle Meshing
+
+Copyright (C) 2024-2026 Arthur Reboul Salze
+
+This Blender extension package is intended to be distributed under the
+GNU General Public License, version 3 or any later version
+(`GPL-3.0-or-later`).
+
+You should treat the extension package code in this folder as GPL-3.0-or-later,
+except where vendored third-party components carry their own preserved notices.
+
+Important third-party attribution files:
+
+- `THIRD_PARTY_NOTICES.md`
+- `../thinkbox-frost/LICENSE.txt`
+- `../thinkbox-frost/NOTICE.txt`
+- `../thinkbox-frost/THIRD-PARTY-LICENSES`
+
+Authoritative GPL text:
+
+https://www.gnu.org/licenses/gpl-3.0.txt

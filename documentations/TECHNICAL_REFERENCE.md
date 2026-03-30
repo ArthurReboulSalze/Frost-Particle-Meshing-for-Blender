@@ -1,6 +1,6 @@
 # Frost for Blender - Technical Reference
 
-Scope: addon release `1.26.0`  
+Scope: addon release `1.26.1`
 Supported Blender version: `5+`
 
 ---
@@ -198,4 +198,4 @@ The current public distribution model is:
 ---
 
 Document version: `1.8`  
-Last update: `2026-03-29`
+Last update: `2026-03-30`

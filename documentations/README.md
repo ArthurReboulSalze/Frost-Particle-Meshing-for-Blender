@@ -1,7 +1,7 @@
 # Frost for Blender - Documentation Index
 
-Current addon version: `1.26.0`  
-Last update: `2026-03-29`
+Current addon version: `1.26.1`  
+Last update: `2026-03-30`
 
 ## Main Documents
 
@@ -28,6 +28,17 @@ For development and maintenance:
 - CPU / CUDA / Vulkan backend structure
 - current limits
 - build notes
+
+### Blender Extensions Compliance
+
+[BLENDER_EXTENSIONS_COMPLIANCE.md](BLENDER_EXTENSIONS_COMPLIANCE.md)
+
+Notes and action items for a future submission to `extensions.blender.org`:
+
+- license positioning
+- extension packaging requirements
+- current compliance blockers
+- migration plan toward a valid Blender Extension package
 
 ### Changelog
 

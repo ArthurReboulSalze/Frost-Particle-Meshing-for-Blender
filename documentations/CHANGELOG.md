@@ -1,7 +1,32 @@
 # Frost for Blender - Changelog
 
-Current addon version: `1.26.0`  
-Last updated: `2026-03-29`
+Current addon version: `1.26.1`  
+Last updated: `2026-03-30`
+
+---
+
+## v1.26.1 - Blender Extensions Packaging Baseline (2026-03-30)
+
+### Added / Improved
+
+- Added a first valid `blender_manifest.toml` for Blender Extensions packaging in the addon folder.
+- Added packaged extension notice files:
+  - `LICENSE.txt`
+  - `THIRD_PARTY_NOTICES.md`
+- Removed the manual `sys.path` mutation from the addon package to align better with Blender Extensions expectations.
+- Added a dedicated compliance tracking note for `extensions.blender.org`.
+- Validated that Blender `5.1` can now parse the manifest and build a local extension archive from the addon folder.
+
+### Fixed
+
+- Excluded legacy adapter artifacts from the extension build, including old `.pyd` files and the bundled CUDA runtime that is not part of the current public `CPU + Vulkan` package.
+- Tightened extension build exclusions so temporary validation helpers are not bundled in the generated extension zip.
+
+### Notes
+
+- This release improves packaging and submission readiness, not the Frost meshing feature set itself.
+- The current public runtime remains the same `CPU + Vulkan` addon workflow.
+- Submission to `extensions.blender.org` still requires a final review of the native binary strategy.
 
 ---
 

@@ -6,7 +6,7 @@
 
 Frost for Blender is a Blender `5+` addon that turns particles, point clouds, and mesh vertices into polygonal surfaces using the Thinkbox Frost core, with an in-progress Vulkan GPU path in the same package.
 
-Current release: `1.26.0`  
+Current release: `1.26.1`  
 <p align="center">
   <img src="Frost4Blender_screen.png" alt="Screenshot of the Frost for Blender addon inside Blender" width="900">
 </p>
@@ -32,6 +32,7 @@ Current release: `1.26.0`
 - The Vulkan GPU path is already functional, but it is still a work in progress.
 - Current testing indicates that CPU still usually wins on low-poly scenes, while Vulkan now reaches parity or can move ahead on heavier / high-poly scenes depending on the mesh, resolution, and animation state.
 - The UI now shows the backend actually used for the last meshing pass, including when a requested GPU run fell back to the CPU for safety.
+- The repository now also includes the first valid Blender Extensions manifest and local extension build setup for future submission work.
 
 ## Installation
 

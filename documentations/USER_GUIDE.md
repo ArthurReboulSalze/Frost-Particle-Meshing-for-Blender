@@ -1,7 +1,7 @@
 # Frost for Blender - User Guide
 
 Supported Blender version: `5+`  
-Compatible addon release: `1.26.0+`
+Compatible addon release: `1.26.1+`
 
 ---
 

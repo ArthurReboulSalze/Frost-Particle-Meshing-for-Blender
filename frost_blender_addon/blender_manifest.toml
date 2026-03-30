@@ -1,0 +1,37 @@
+schema_version = "1.0.0"
+
+id = "frost_particle_meshing"
+version = "1.26.1"
+name = "Frost Particle Meshing"
+tagline = "Mesh particles and animated sources with Frost and Vulkan"
+maintainer = "Arthur Reboul Salze"
+type = "add-on"
+website = "https://github.com/ArthurReboulSalze/Frost-for-Blender"
+
+tags = ["Mesh", "Object"]
+blender_version_min = "5.0.0"
+platforms = ["windows-x64"]
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+copyright = [
+  "2024-2026 Arthur Reboul Salze",
+  "2022 Amazon.com, Inc. or its affiliates",
+]
+
+[permissions]
+files = "Export Alembic sequences and other user-requested output files"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "*.pyc",
+  "*.pyo",
+  "*.pyd",
+  "blender_frost_adapter.cp310-win_amd64.pyd",
+  "blender_frost_adapter.pyd",
+  "cudart64_12.dll",
+  "test_load.py",
+]
