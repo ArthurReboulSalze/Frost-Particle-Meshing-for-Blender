@@ -1,5 +1,3 @@
-# Frost for Blender
-
 <p align="center">
   <img src="Frost4Blender.png" alt="Frost for Blender logo" width="1086">
 </p>
