@@ -1,7 +1,7 @@
 # Frost for Blender
 
 <p align="center">
-  <img src="Frost4Blender.png" alt="Frost for Blender logo" width="260">
+  <img src="Frost4Blender.png" alt="Frost for Blender logo" width="1086">
 </p>
 
 Frost for Blender is a Blender `5+` addon that turns particles, point clouds, and mesh vertices into polygonal surfaces using the Thinkbox Frost core, with an in-progress Vulkan GPU path in the same package.
